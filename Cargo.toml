@@ -3,6 +3,8 @@ name = "rabbit-auto"
 version = "0.1.0"
 authors = ["Anicka Burova <anicka.burova@gmail.com>"]
 edition = "2018"
+licence = "MIT"
+description = "Wrappers for lapin publishers and consumers"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [features]
