@@ -13,6 +13,7 @@ enum Action {
     Nack(Option<BasicNackOptions>),
 }
 /// Automatically ack delivery when this struct drops.
+/// There is an option to automatically nack the delivery.
 pub struct AutoAck {
     args: Option<(Channel, u64)>,
     action: Action,

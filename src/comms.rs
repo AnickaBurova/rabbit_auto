@@ -14,11 +14,7 @@ pub type CreatorResult<T> = Pin<Box<dyn Future<Output = Result<T>> + Send>>;
 /// Creator function
 pub type Creator<T> = Pin<Box<dyn Fn(Channel) -> CreatorResult<T> + Send + Sync>>;
 
-
-/// RabbitMQ connection singleton
-pub enum Comms {
-    /// Unconfigured, this needs to be configured before the first use
-    Invalid,
+enum State {
     /// Configured, but not connected at least once
     Configured {
         config: Config,
@@ -30,19 +26,21 @@ pub enum Comms {
     },
 }
 
+/// RabbitMQ connection singleton
+pub struct Comms {
+    state: Option<State>,
+}
+
 
 impl Comms {
-    fn take(&mut self) -> Self {
-        std::mem::replace(self, Self::Invalid)
-    }
     /// Creates an uninitialised connection
     fn new() -> Arc<Mutex<Self>> {
-        Arc::new(Mutex::new(Self::Invalid))
+        Arc::new(Mutex::new(Self { state: None }))
     }
 
     fn get_connection(&mut self) -> &mut Connection {
-        match self {
-            Self::Connected { connection, .. } => connection,
+        match &mut self.state {
+            Some(State::Connected { connection, .. }) => connection,
             _ => unreachable!(),
         }
     }
@@ -55,22 +53,22 @@ impl Comms {
     /// The default behaviour is, it will only finish if the connection is establish, otherwise this
     /// will not finish and will wait for connection.
     async fn connect(&mut self) -> Result<&mut Connection> {
-        let (config, repeat) = match self.take() {
-            Self::Invalid => return Err(anyhow::anyhow!("RabbitMQ connection is not configured")),
-            Self::Connected { connection, config } => {
+        let (config, repeat) = match self.state.take() {
+            None => return Err(anyhow::anyhow!("RabbitMQ connection is not configured")),
+            Some(State::Connected { connection, config }) => {
                 log::trace!("Testing validity of rabbit connection");
                 let status = connection.status();
                 if status.connected() {
                     // if the connection is valid, then just return
                     log::trace!("Rabbit is ok");
-                    *self = Self::Connected { connection, config };
+                    self.state = Some(State::Connected { connection, config });
                     return Ok(self.get_connection());
                 }
                 (config, true)
             }
             // if this is the very first attempt to make a connection, it is not allowed to repeat,
             // because the failure might be just misconfigured rabbit instead of temporary not available
-            Self::Configured { config } => (config, false),
+            Some(State::Configured { config }) => (config, false),
         };
         loop {
             log::trace!("Connecting to rabbitmq");
@@ -82,7 +80,7 @@ impl Comms {
             match connection {
                 Ok(connection) => {
                     log::trace!("Connected");
-                    *self = Self::Connected { connection, config };
+                    self.state = Some(State::Connected { connection, config });
                     return Ok(self.get_connection());
                 }
                 Err(err) => {
@@ -107,8 +105,12 @@ impl Comms {
         let mut this = this.lock().await;
         loop {
             let connection = this.connect().await?;
+            log::trace!("Creating a channel");
             match connection.create_channel().await {
-                Ok(channel) => return Ok(channel),
+                Ok(channel) => {
+                    log::trace!("Channel {} created", channel.id());
+                    return Ok(channel);
+                },
                 Err(err) => {
                     log::error!("Failed to create a channel: {}", err);
                     continue;
@@ -133,18 +135,24 @@ impl Comms {
         let mut this = this.lock().await;
         loop {
             let connection = this.connect().await?;
-            log::trace!("Creating a new channel on rabbit");
+            log::trace!("Creating a channel and the object");
             let channel =
                 match connection.create_channel().await {
-                    Ok(channel) => channel,
+                    Ok(channel) => {
+                        log::trace!("Channel {} created", channel.id());
+                        channel
+                    },
                     Err(err) => {
                         log::error!("Failed to create a channel: {}", err);
                         continue;
                     }
                 };
-            log::trace!("Running creator on rabbit");
+            log::trace!("Running the creator");
             match creator(channel).await {
-                Ok(obj) => return Ok((creator, obj)),
+                Ok(obj) => {
+                    log::trace!("The object has been created");
+                    return Ok((creator, obj))
+                },
                 Err(err) => {
                     log::error!("Failed to create an object: {}", err);
                 }
@@ -156,7 +164,7 @@ impl Comms {
     pub async fn configure(config: Config) {
         let this = Self::get();
         let mut this = this.lock().await;
-        *this = Self::Configured { config };
+        this.state = Some(State::Configured { config });
     }
 
     /// Gets the Comms's Singleton

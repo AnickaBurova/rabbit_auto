@@ -3,6 +3,7 @@ use crate::auto_ack::{AutoAck, auto_ack};
 use lapin::Channel;
 use crate::consumer::ConsumerWrapper;
 use anyhow::Result;
+use lapin::message::Delivery;
 
 #[derive(Clone, Default)]
 pub struct StreamBuilder<T, K, E> {
@@ -27,7 +28,8 @@ impl<T,K,E> StreamBuilder<T, K, E>
           K: AsRef<str> + Send + Unpin + 'static + Clone + Sync,
           E: AsRef<str> + Send + Unpin + 'static + Clone + Sync,
 {
-    pub async fn create_auto_ack<I: Deserialise>(self) -> Result<impl StreamExt<Item = (AutoAck, Result<I>)> + Unpin> {
+    /// Creates a consumer which returns channel and the delivery.
+    pub async fn create_plain(self) -> Result<impl StreamExt<Item = (Channel, Delivery)> + Unpin> {
         let consumer = ConsumerWrapper::new(Box::pin(move |channel: Channel| {
             // log::trace!("Declaring rabbit '{}' queue", stringify!($item));
             let this = self.clone();
@@ -45,13 +47,13 @@ impl<T,K,E> StreamBuilder<T, K, E>
                 log::trace!("Queue declared, binding it");
                 channel
                     .queue_bind(
-                    this.routing_key.as_ref(),
-                    this.exchange.as_ref(),
-                    this.routing_key.as_ref(),
-                    this.binding.unwrap_or_else(|| lapin::options::QueueBindOptions::default()),
-                    this.binding_fields.unwrap_or_else(|| lapin::types::FieldTable::default()),
-                )
-                .await?;
+                        this.routing_key.as_ref(),
+                        this.exchange.as_ref(),
+                        this.routing_key.as_ref(),
+                        this.binding.unwrap_or_else(|| lapin::options::QueueBindOptions::default()),
+                        this.binding_fields.unwrap_or_else(|| lapin::types::FieldTable::default()),
+                    )
+                    .await?;
                 // log::trace!(
                 //     "Creating rabbit '{}' consumer at {}",
                 //     stringify!($item),
@@ -63,94 +65,24 @@ impl<T,K,E> StreamBuilder<T, K, E>
                         this.tag.as_ref(),
                         this.consume.unwrap_or_else(|| lapin::options::BasicConsumeOptions::default()),
                         this.consume_fields.unwrap_or_else(|| lapin::types::FieldTable::default()),
-                )
-                .await?;
+                    )
+                    .await?;
                 Ok((channel, consumer))
             })
         }))
             .await?;
+       Ok(consumer)
+    }
+
+    /// Creates a consumer which returns deserialised item with a channel
+    pub async fn create<I: Deserialise>(self) -> Result<impl StreamExt<Item = (Channel, Result<I>)> + Unpin> {
+        let consumer = self.create_plain().await?;
+        Ok(consumer.map(|(channel, delivery)| (channel, I::deserialise(delivery.data))))
+    }
+
+    /// Creates a consumer which returns autoack and the item
+    pub async fn create_auto_ack<I: Deserialise>(self) -> Result<impl StreamExt<Item = (AutoAck, Result<I>)> + Unpin> {
+        let consumer = self.create_plain().await?;
         Ok(auto_ack(consumer).map(|(ack, delivery)| (ack, I::deserialise(delivery.data))))
     }
-}
-
-
-#[macro_export]
-macro_rules! stream {
-    ($function: ident <$item: ident> $($auto_ack: ident)*{
-         tag = $tag: expr,
-         exchange =  $exchange: expr,
-         $(qos = $qos: expr,)*
-         declare = [$($declare: ident = $decl_value: expr;)*]
-         fields = [$($fields: literal = $fields_value: expr;)*]
-         }
-    ) => {
-            pub async fn $function<K: AsRef<str>>(routing_key: K) -> stream!{result $($auto_ack)*} {
-                let consumer = rabbit_auto::consumer::ConsumerWrapper::new(Box::pin(move |channel: Channel| {
-                    log::trace!("Declaring rabbit '{}' queue", stringify!($item));
-                    Box::pin(async move {
-                        $(
-                            channel.basic_qos($qos, lapin::options::BasicQosOptions::default()).await?;
-                        )*
-                        let declare = lapin::options::QueueDeclareOptions {
-                            $(declare.$declare = $decl_value,)*
-                            ..lapin::options::QueueDeclareOptions::default()};
-                        stream!{let args $($fields)*} = lapin::types::FieldTable::default();
-                        $(
-                            args.insert($fields.into(), lapin::types::AMQPValue::LongUInt($fields_value));
-                        )*
-                        channel.queue_declare(routing_key.as_ref(), declare, args).await?;
-                        log::trace!("Queue declared, binding it");
-                        channel
-                            .queue_bind(
-                                routing_key.as_ref(),
-                                rabbit::$exchange,
-                                routing_key.as_ref(),
-                                lapin::options::QueueBindOptions::default(),
-                                FieldTable::default(),
-                            )
-                            .await?;
-                        log::trace!(
-                            "Creating rabbit '{}' consumer at {}",
-                            stringify!($item),
-                            channel.id()
-                        );
-                        let consumer = channel
-                            .basic_consume(
-                                routing_key.as_ref(),
-                                $tag,
-                                BasicConsumeOptions::default(),
-                                FieldTable::default(),
-                            )
-                            .await?;
-                        Ok((channel, consumer))
-                    })
-                }))
-                .await;
-                log::trace!("Got consumer");
-                stream!{return $($auto_ack)*}
-            }
-    };
-
-    (return auto_ack) => {
-        rabbit_auto::auto_ack::auto_ack(consumer)
-    };
-
-    (return) => {
-        consumer
-    };
-
-    (result auto_ack) => {
-        impl Stream<Item = (rabbit_auto::auto_ack::AutoAck, lapin::message::Delivery)>
-    };
-    (result ) =>  {
-        impl Stream<Item = (lapin::Channel, lapin::message::Delivery)>
-    };
-
-    (let $name: ident $($anything: ident)+) => {
-        let mut $name
-    };
-    (let $name: ident ) => {
-        let $name
-    };
-
 }

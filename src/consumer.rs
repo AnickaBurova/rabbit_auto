@@ -27,8 +27,6 @@ type NextFuture = Pin<
 >;
 
 enum State {
-    /// Intermediate state where this object is in the middle of something or just generally invalid after an error
-    Invalid,
     /// Waiting to start looking for the next item
     Idle {
         /// RabbitMQ consumer
@@ -51,7 +49,7 @@ enum State {
 /// consuming like nothing happened. But if the connection was never established at least once, the stream
 /// end right away!
 pub struct ConsumerWrapper {
-    state: State,
+    state: Option<State>,
 }
 
 impl ConsumerWrapper {
@@ -60,7 +58,7 @@ impl ConsumerWrapper {
     pub async fn new(creator: ConsumerCreator) -> Result<Self> {
         let (creator, (channel, consumer)) = Self::connect(creator).await?;
         log::debug!("Consumer wrapper created");
-        Ok(Self { state: State::Idle { consumer, channel, creator } })
+        Ok(Self { state: Some(State::Idle { consumer, channel, creator }) })
     }
 
     /// Connects to the rabbit by passing the creator function
@@ -70,10 +68,6 @@ impl ConsumerWrapper {
         Comms::create_channel_and_object::<(Channel, Consumer)>(creator).await
     }
 
-    /// Take the current state and replace it with the invalid state
-    fn take(&mut self) -> State {
-        std::mem::replace(&mut self.state, State::Invalid)
-    }
 
     /// Gets the next item from the consumer. If the consumer is broken, then a new consumer is automatically created
     async fn next_item(mut consumer: Consumer, mut channel: Channel, mut creator: ConsumerCreator)
@@ -109,28 +103,28 @@ impl Stream for ConsumerWrapper {
         let this = Pin::into_inner(self);
 
         loop {
-            match this.take() {
-                State::Idle { consumer, channel, creator } => {
-                    this.state = State::Next {
+            match this.state.take() {
+                Some(State::Idle { consumer, channel, creator }) => {
+                    this.state = Some(State::Next {
                         next: Box::pin(Self::next_item(consumer, channel, creator)),
-                    };
+                    });
                 }
-                State::Next { mut next } => {
+                Some(State::Next { mut next }) => {
                     let action = next.as_mut();
                     return match Future::poll(action, cx) {
                         Poll::Pending => {
-                            this.state = State::Next { next };
+                            this.state = Some(State::Next { next });
                             log::debug!("Pending");
                             Poll::Pending
                         }
                         Poll::Ready((delivery, consumer, channel, creator)) => {
-                            this.state = State::Idle { consumer, channel, creator };
+                            this.state = Some(State::Idle { consumer, channel, creator });
                             log::debug!("Ready");
                             Poll::Ready(Some(delivery))
                         }
                     }
                 }
-                State::Invalid => unreachable!(),
+                None => unreachable!(),
             }
         }
     }
