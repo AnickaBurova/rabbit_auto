@@ -75,9 +75,9 @@ impl<T,K,E> StreamBuilder<T, K, E>
     }
 
     /// Creates a consumer which returns deserialised item with a channel
-    pub async fn create<I: Deserialise>(self) -> Result<impl StreamExt<Item = (Channel, Result<I>)> + Unpin> {
+    pub async fn create<I: Deserialise>(self) -> Result<impl StreamExt<Item = ((Channel, u64), Result<I>)> + Unpin> {
         let consumer = self.create_plain().await?;
-        Ok(consumer.map(|(channel, delivery)| (channel, I::deserialise(delivery.data))))
+        Ok(consumer.map(|(channel, delivery)| ((channel, delivery.delivery_tag), I::deserialise(delivery.data))))
     }
 
     /// Creates a consumer which returns autoack and the item
