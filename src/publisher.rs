@@ -9,6 +9,8 @@ use futures::{
     Sink,
 };
 use std::collections::VecDeque;
+use std::sync::Arc;
+use futures::lock::Mutex;
 use crate::comms::Comms;
 use lapin::options::{ConfirmSelectOptions, BasicPublishOptions};
 
@@ -20,14 +22,10 @@ pub type GetBPO = Pin<Box<dyn Fn() -> BasicPublishOptions + Send + Sync>>;
 pub type GetBP = Pin<Box<dyn Fn() -> BasicProperties + Send + Sync>>;
 
 
-type Data<E> = (Channel, E, Option<GetCSO>, Option<GetBPO>, Option<GetBP>);
+type Data<E> = (Arc<Mutex<Channel>>, E, Option<GetCSO>, Option<GetBPO>, Option<GetBP>);
 
-/// Trait used to serialise the item in to byte vector data.
-/// This is used as payload for the message.
-pub trait Serialise {
-    /// Gets the serialised data of the item.
-    fn serialise(data: &Self) -> Vec<u8>;
-}
+mod serialise;
+pub use serialise::Serialise;
 
 /// Creates a callback which creates the simples case of confirm select options.
 pub fn simple_confirm_options() -> GetCSO {
@@ -38,7 +36,7 @@ pub fn simple_confirm_options() -> GetCSO {
 enum State<Item, Address>
 {
     Idle {
-        channel: Channel,
+        channel: Arc<Mutex<Channel>>,
         address: Address,
         confirm: Option<GetCSO>,
         publish_options: Option<GetBPO>,
@@ -59,7 +57,7 @@ pub struct PublishWrapper<Item, Address>
 }
 
 impl<Item, Address> PublishWrapper<Item, Address> {
-    async fn connect() -> Result<Channel> {
+    async fn connect() -> Arc<Mutex<Channel>> {
         Comms::create_channel().await
     }
 
@@ -76,8 +74,9 @@ impl<Item, Address> PublishWrapper<Item, Address> {
         Ok(())
     }
 
-    async fn set_channel(channel: Channel, confirm: Option<GetCSO>) -> std::result::Result<(Channel, Option<GetCSO>), (anyhow::Error, Option<GetCSO>)> {
+    async fn set_channel(channel: Arc<Mutex<Channel>>, confirm: Option<GetCSO>) -> std::result::Result<(Arc<Mutex<Channel>>, Option<GetCSO>), (anyhow::Error, Option<GetCSO>)> {
         let confirm = if let Some(confirm) = confirm {
+            let channel = channel.lock().await;
             if let Err(err) = channel
                 .confirm_select(confirm())
                 .await {
@@ -90,67 +89,75 @@ impl<Item, Address> PublishWrapper<Item, Address> {
         Ok((channel, confirm))
     }
 
-    async fn send<T,E,K, D, R>(item: T,
-                               mut channel: Channel,
-                      exchange: E,
-                      routing_key: K,
-                      mut confirm: Option<GetCSO>,
-                      publish_options: Option<GetBPO>,
-                      publish_properties: Option<GetBP>,
-                      return_func: R,
+    async fn send<T, E,K, D, R>(
+            item: T,
+            mut channel: Arc<Mutex<Channel>>,
+            exchange: E,
+            routing_key: K,
+            mut confirm: Option<GetCSO>,
+            publish_options: Option<GetBPO>,
+            publish_properties: Option<GetBP>,
+            return_func: R,
         ) -> Data<D>
             where T: Unpin + Send + Serialise,
                   E: AsRef<str> + Send + Unpin + 'static,
                   K: AsRef<str> + Send + Unpin + 'static,
-                  R: FnOnce(Channel, E, K, Option<GetCSO>, Option<GetBPO>, Option<GetBP>) -> Data<D>,
+                  R: FnOnce(Arc<Mutex<Channel>>, E, K, Option<GetCSO>, Option<GetBPO>, Option<GetBP>) -> Data<D>,
         {
+            let data = T::serialise(&item);
+            if data.as_ref().is_empty()  {
+                log::trace!("Data is empty, skipping sending nothing");
+                return return_func(channel, exchange, routing_key, confirm, publish_options, publish_properties);
+            }
             loop {
-                // item has to be serialised over and over, because the data is actually send over to rabbit.
-                // but if the rabbit fails to pusblish it, the data itself is gone so we need to get a new one to repeat
-                let data = Serialise::serialise(&item);
-                let publish = channel.basic_publish(
-                    exchange.as_ref(),
-                    routing_key.as_ref(),
-                    publish_options.as_ref().map(|o| o()).unwrap_or_else(||BasicPublishOptions::default()),
-                    data,
-                    publish_properties.as_ref().map(|p| p()).unwrap_or_else(|| BasicProperties::default()),
-                );
-                match publish.await {
-                    Ok(result) => {
-                        use lapin::publisher_confirm::Confirmation;
-                        match (result.await, confirm.is_some()) {
-                            (Ok(Confirmation::Ack(None)), true) => {
-                                log::trace!(
-                                    "Publish on channel {} confirmed",
-                                    channel.id()
-                                );
-                                return return_func(channel, exchange, routing_key, confirm, publish_options, publish_properties);
-                            }
-                            (Ok(_), true) => {
-                                log::error!("Failed to confirm message publish on channel {}, repeating the send", channel.id());
-                                continue;
-                            }
-                            (Err(err), _) => {
-                                log::error!("Failed to publish message on channel {}, repeating the send: {}", channel.id(), err);
-                            }
-                            (_, false) => {
-                                log::trace!("Published");
-                                return return_func(channel, exchange, routing_key, confirm, publish_options, publish_properties);
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        log::error!(
-                            "Failed to send message to {} of key {}: {}",
+                {
+                    let (publish, id) = {
+                        let channel = channel.lock().await;
+                        (channel.basic_publish(
                             exchange.as_ref(),
                             routing_key.as_ref(),
-                            err
-                        );
+                            publish_options.as_ref().map(|o| o()).unwrap_or_else(|| BasicPublishOptions::default()),
+                            data.as_ref(),
+                            publish_properties.as_ref().map(|p| p()).unwrap_or_else(|| BasicProperties::default()),
+                        ).await, channel.id())
+                    };
+                    match publish {
+                        Ok(result) => {
+                            use lapin::publisher_confirm::Confirmation;
+                            match (result.await, confirm.is_some()) {
+                                (Ok(Confirmation::Ack(None)), true) => {
+                                    log::trace!(
+                                        "Publish on channel {} confirmed",
+                                        id,
+                                    );
+                                    return return_func(channel, exchange, routing_key, confirm, publish_options, publish_properties);
+                                }
+                                (Ok(_), true) => {
+                                    log::error!("Failed to confirm message publish on channel {}, repeating the send", id);
+                                    continue;
+                                }
+                                (Err(err), _) => {
+                                    log::error!("Failed to publish message on channel {}, repeating the send: {}", id, err);
+                                }
+                                (_, false) => {
+                                    log::trace!("Published");
+                                    return return_func(channel, exchange, routing_key, confirm, publish_options, publish_properties);
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            log::error!(
+                                "Failed to send message to {} of key {}: {}",
+                                exchange.as_ref(),
+                                routing_key.as_ref(),
+                                err
+                            );
+                        }
                     }
                 }
                 loop {
                     // here we can unwrap, because the connect should never fail if it succeeded once
-                    match Self::set_channel(Self::connect().await.unwrap(), confirm).await {
+                    match Self::set_channel(Self::connect().await, confirm).await {
                         Ok((value, con)) => {
                             channel = value;
                             confirm = con;
@@ -168,8 +175,8 @@ impl<Item, Address> PublishWrapper<Item, Address> {
 
 impl<T, E, K> Sink<T> for PublishWrapper<T, (E, K)>
     where T: Unpin + Send + Serialise + 'static,
-          E: AsRef<str> + Send + Unpin + 'static,
-          K: AsRef<str> + Send + Unpin + 'static,
+          E: AsRef<str> + Send + Unpin + 'static + Sync,
+          K: AsRef<str> + Send + Unpin + 'static + Sync,
 {
     type Error = Error;
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<()>> {
@@ -191,8 +198,11 @@ impl<T, E, K> Sink<T> for PublishWrapper<T, (E, K)>
                 }
                 Some(State::Idle { channel, address: (exchange, routing_key), confirm, publish_options, publish_properties, mut queue }) => {
                     if let Some(item) = queue.pop_front() {
+                        let return_func = move|channel, exchange, key, confirm, publish_options, publish_properties| (channel, (exchange, key), confirm, publish_options, publish_properties);
                         this.state = Some(State::Sending {
-                            send: Box::pin(Self::send(item, channel, exchange, routing_key, confirm, publish_options, publish_properties, |channel, exchange, key, confirm, publish_options, publish_properties| (channel, (exchange, key), confirm, publish_options, publish_properties))),
+                            send: Box::pin(
+                                Self::send(
+                                    item, channel, exchange, routing_key, confirm, publish_options, publish_properties, return_func)),
                             queue,
                         });
                     } else {
@@ -222,8 +232,8 @@ impl<T, E, K> Sink<T> for PublishWrapper<T, (E, K)>
 
 impl<T, E, K> Sink<(T, K)> for PublishWrapper<(T, K), E>
     where T: Unpin + Send + Serialise + 'static,
-          E: AsRef<str> + Send + Unpin + 'static,
-          K: AsRef<str> + Send + Unpin + 'static,
+          E: AsRef<str> + Send + Unpin + 'static + Sync,
+          K: AsRef<str> + Send + Unpin + 'static + Sync,
 {
     type Error = Error;
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<()>> {
@@ -288,10 +298,10 @@ impl<T,E,K> PublishWrapper<T, (E, K)>
         mut confirm: Option<GetCSO>,
         publish_options: Option<GetBPO>,
         publish_properties: Option<GetBP>,
-    ) -> Result<Self>
+    ) -> Self
     {
         loop {
-            let (channel, confirm) = match Self::set_channel(Self::connect().await?, confirm).await {
+            let (channel, confirm) = match Self::set_channel(Self::connect().await, confirm).await {
                 Ok(value) => value,
                 Err((err, con)) => {
                     log::error!("Failing to set confirm select on the channel: {}", err);
@@ -299,7 +309,7 @@ impl<T,E,K> PublishWrapper<T, (E, K)>
                     continue;
                 }
             };
-            return Ok(Self { state: Some(State::Idle { channel, address: (exchange, routing_key), confirm, publish_options, publish_properties, queue: VecDeque::new() } )});
+            return Self { state: Some(State::Idle { channel, address: (exchange, routing_key), confirm, publish_options, publish_properties, queue: VecDeque::new() } )};
         }
     }
 }
@@ -317,11 +327,11 @@ impl<T,E,K> PublishWrapper<(T,K), E>
         mut confirm: Option<GetCSO>,
         publish_options: Option<GetBPO>,
         publish_properties: Option<GetBP>,
-    ) -> Result<Self>
+    ) -> Self
     {
 
         loop {
-            let (channel, confirm) = match Self::set_channel(Self::connect().await?, confirm).await {
+            let (channel, confirm) = match Self::set_channel(Self::connect().await, confirm).await {
                 Ok(value) => value,
                 Err((err, con)) => {
                     log::error!("Failing to set confirm select on the channel: {}", err);
@@ -329,7 +339,7 @@ impl<T,E,K> PublishWrapper<(T,K), E>
                     continue;
                 }
             };
-            return Ok(Self { state: Some(State::Idle { channel, address: exchange, confirm, publish_options, publish_properties, queue: VecDeque::new() }) });
+            return Self { state: Some(State::Idle { channel, address: exchange, confirm, publish_options, publish_properties, queue: VecDeque::new() }) };
         }
     }
 }

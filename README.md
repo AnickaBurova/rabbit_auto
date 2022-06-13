@@ -9,6 +9,7 @@ use rabbit_auto::publisher::{Serialise, PublishWrapper, simple_confirm_options};
 use rabbit_auto::comms::Comms;
 use rabbit_auto::config::Config;
 
+/// If the configure is not called, the library will kill the app using `std::process::exit()`
 Comms::configure(Config::new("rabbit-host-ip", "rabbit user", "rabbit password",
                             // reconnection interval when the connection is lost
                             Duration::from_secs(3)).await;

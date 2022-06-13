@@ -1,5 +1,6 @@
 //! A stream wrapper for rabbitmq consumer. This stream never fails and will consume until stopped being used.
 use core::pin::Pin;
+use std::sync::Arc;
 use futures::{
     future::Future,
     stream::Stream,
@@ -7,20 +8,24 @@ use futures::{
 };
 use lapin::{message::Delivery, Channel, Consumer};
 use anyhow::Result;
+use futures::lock::Mutex;
 
 use super::comms::*;
 
 /// Returns a future which creates the consumer from the provided channel.
-pub type ConsumerCreator = Creator<(Channel, Consumer)>;
+pub type ConsumerCreator = Creator<(Arc<Mutex<Channel>>, Consumer)>;
+
+pub type CreatorResult<T> = Pin<Box<dyn Future<Output = Result<T>> + Send>>;
+pub type Creator<T> = Pin<Box<dyn Fn(Arc<Mutex<Channel>>) -> CreatorResult<T> + Send + Sync>>;
 
 type NextFuture = Pin<
     Box<
         dyn Future<
             Output = (
-                (Channel, Delivery),
+                Delivery,
                 Consumer,
-                Channel,
-                Creator<(Channel, Consumer)>,
+                Arc<Mutex<Channel>>,
+                ConsumerCreator,
             ),
         > + Send,
     >,
@@ -33,7 +38,7 @@ enum State {
         consumer: Consumer,
         /// RabbitMQ channel, this has to be keep here for having the consumer alive, otherwise there will
         /// be non channel alive for the consumer, and the consumer would be dropped.
-        channel: Channel,
+        channel: Arc<Mutex<Channel>>,
         /// Creator of the consumer
         creator: ConsumerCreator,
     },
@@ -55,23 +60,36 @@ pub struct ConsumerWrapper {
 impl ConsumerWrapper {
     /// Create a new consumer by providing a creator function. This function might be called many times,
     /// as often as we loose connection to the rabbitmq.
-    pub async fn new(creator: ConsumerCreator) -> Result<Self> {
-        let (creator, (channel, consumer)) = Self::connect(creator).await?;
+    // pub async fn new(creator: ConsumerCreator) -> Result<Self> {
+    //     let (creator, (channel, consumer)) = Self::connect(creator).await?;
+    //     log::debug!("Consumer wrapper created");
+    //     Ok(Self { state: Some(State::Idle { consumer, channel, creator }) })
+    // }
+    pub async fn new(creator: ConsumerCreator) -> Self {
+        let (creator, (channel, consumer)) = Self::connect(creator).await;
         log::debug!("Consumer wrapper created");
-        Ok(Self { state: Some(State::Idle { consumer, channel, creator }) })
+        Self { state: Some(State::Idle { consumer, channel, creator })}
     }
 
     /// Connects to the rabbit by passing the creator function
+    // async fn connect(
+    //     creator: ConsumerCreator,
+    // ) -> Result<(ConsumerCreator, (Channel, Consumer))> {
+    //     Comms::create_channel_and_object::<(Channel, Consumer)>(creator).await
+    // }
+
     async fn connect(
         creator: ConsumerCreator,
-    ) -> Result<(ConsumerCreator, (Channel, Consumer))> {
-        Comms::create_channel_and_object::<(Channel, Consumer)>(creator).await
+    ) -> (
+        Creator<(Arc<Mutex<Channel>>, Consumer)>,
+        (Arc<Mutex<Channel>>, Consumer),
+    ) {
+        Comms::create_object::<(Arc<Mutex<Channel>>, Consumer)>(creator).await
     }
 
-
     /// Gets the next item from the consumer. If the consumer is broken, then a new consumer is automatically created
-    async fn next_item(mut consumer: Consumer, mut channel: Channel, mut creator: ConsumerCreator)
-        -> ((Channel, Delivery), Consumer, Channel, ConsumerCreator) {
+    async fn next_item(mut consumer: Consumer, mut channel: Arc<Mutex<Channel>>, mut creator: ConsumerCreator)
+        -> (Delivery, Consumer, Arc<Mutex<Channel>>, ConsumerCreator) {
         loop {
             use futures::stream::StreamExt;
             log::debug!("Polling consumer");
@@ -88,7 +106,7 @@ impl ConsumerWrapper {
                 }
             }
             log::warn!("Recreating the consumer");
-            let (cr, (chan, cons)) = Self::connect(creator).await.unwrap();
+            let (cr, (chan, cons)) = Self::connect(creator).await;
             creator = cr;
             consumer = cons;
             channel = chan;
@@ -97,7 +115,7 @@ impl ConsumerWrapper {
 }
 
 impl Stream for ConsumerWrapper {
-    type Item = (Channel, Delivery);
+    type Item = Delivery;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
         log::debug!("Poll next");
         let this = Pin::into_inner(self);

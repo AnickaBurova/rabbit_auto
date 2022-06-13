@@ -1,12 +1,14 @@
 //! Configuration for the rabbitmq connection.
 //!
 //!
+use std::fmt::Display;
 use std::time::Duration;
 
 /// Configuration for the rabbitmq connection
 pub struct Config {
-    pub address: String,
-    pub sleep_duration: Duration,
+    pub name: String,
+    pub address: Vec<String>,
+    pub reconnect_delay: Duration,
 }
 
 impl Config {
@@ -16,11 +18,16 @@ impl Config {
     /// * user - user login name
     /// * password - user login password
     /// * sleep_duration - duration of the sleep before trying reconnect again to the rabbitmq server
-    pub fn new(host: &str, user: &str, password: &str, sleep_duration: Duration) -> Self {
-        let address = format!("amqp://{}:{}@{}/%2f", user, password, host);
+    pub fn new<I: Display, T: Iterator<Item = I>>(name: String, host: T, user: &str, password: &str, reconnect_delay: Duration) -> Self {
+        let mut address = Vec::new();
+        for addr in host {
+            let addr = format!("amqp://{}:{}@{}/%2f", user, password, addr);
+            address.push(addr);
+        }
         Self {
+            name,
             address,
-            sleep_duration,
+            reconnect_delay,
         }
     }
 }
