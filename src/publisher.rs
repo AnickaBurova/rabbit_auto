@@ -13,6 +13,7 @@ use std::sync::Arc;
 use futures::lock::Mutex;
 use crate::comms::Comms;
 use lapin::options::{ConfirmSelectOptions, BasicPublishOptions};
+pub mod publisher_properties;
 
 /// Callback to create confirm select options
 pub type GetCSO = Pin<Box<dyn Fn() -> ConfirmSelectOptions + Send + Sync>>;
