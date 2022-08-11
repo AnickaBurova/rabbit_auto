@@ -1,5 +1,10 @@
 //! A stream wrapper for rabbitmq consumer. This stream never fails and will consume until stopped being used.
 use core::pin::Pin;
+#[cfg(feature = "tokio_runtime")]
+use tokio::sync::RwLock;
+#[cfg(feature = "async_std_runtime")]
+use async_std::sync::RwLock;
+use std::collections::HashMap;
 use std::sync::Arc;
 use futures::{
     future::Future,
@@ -9,6 +14,7 @@ use futures::{
 use lapin::{message::Delivery, Channel, Consumer};
 use anyhow::Result;
 use futures::lock::Mutex;
+use crate::exchanges::DeclareExchange;
 
 use super::comms::*;
 
@@ -16,7 +22,7 @@ use super::comms::*;
 pub type ConsumerCreator = Creator<(Arc<Mutex<Channel>>, Consumer)>;
 
 pub type CreatorResult<T> = Pin<Box<dyn Future<Output = Result<T>> + Send>>;
-pub type Creator<T> = Pin<Box<dyn Fn(Arc<Mutex<Channel>>) -> CreatorResult<T> + Send + Sync>>;
+pub type Creator<T> = Pin<Box<dyn Fn(Arc<Mutex<Channel>>, Arc<RwLock<HashMap<String, DeclareExchange>>>) -> CreatorResult<T> + Send + Sync>>;
 
 type NextFuture = Pin<
     Box<

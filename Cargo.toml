@@ -13,11 +13,11 @@ tokio_runtime = ["tokio"]
 async_std_runtime = ["async-std"]
 
 [dependencies]
-anyhow = "1.0.57"
+anyhow = "1.0.60"
 futures = "0.3.21"
 lapin = "2.1.1"
 lazy_static = "1.4.0"
 log = "0.4.17"
 nom = "7.1.1"
-tokio = { version = "1.18.2", optional = true, features = ["rt", "time"] }
-async-std = { version = "1.11.0", optional = true }
+tokio = { version = "1.20.1", optional = true, features = ["rt", "time", "sync"] }
+async-std = { version = "1.12.0", optional = true }

@@ -1,19 +1,26 @@
 //! Helper to create a connection and keep it connected.
 
 
+use std::collections::HashMap;
 use lapin::{Connection, Channel, ConnectionProperties};
-use std::sync::Arc;
+use std::sync::{Arc};
 use futures::lock::Mutex;
 use std::pin::Pin;
 use futures::Future;
 use lapin::types::{AMQPValue, ShortUInt};
 use crate::comms::comms_data::Data;
 use crate::config::Config;
+#[cfg(feature = "tokio_runtime")]
+use tokio::sync::RwLock;
+#[cfg(feature = "async_std_runtime")]
+use async_std::sync::RwLock;
+use crate::exchanges::DeclareExchange;
 
 /// Result of the creator function
 pub type CreatorResult<T> = Pin<Box<dyn Future<Output = anyhow::Result<T>> + Send>>;
 /// Creator function
-pub type Creator<T> = Pin<Box<dyn Fn(Arc<Mutex<Channel>>) -> CreatorResult<T> + Send + Sync>>;
+pub type Creator<T> = Pin<Box<dyn Fn(Arc<Mutex<Channel>>, Arc<RwLock<HashMap<String, DeclareExchange>>>) -> CreatorResult<T> + Send + Sync>>;
+
 
 
 mod comms_data;
@@ -24,6 +31,7 @@ pub struct Comms {
     config: Option<Config>,
     /// Counter
     connection_attempt: usize,
+    exchanges: Arc<RwLock<HashMap<String, DeclareExchange>>>,
     /// The connection
     connection: Option<Data>,
 }
@@ -32,10 +40,14 @@ pub struct Comms {
 impl Comms {
     /// Creates an uninitialised connection
     fn new() -> Arc<Mutex<Self>> {
-        Arc::new(Mutex::new(Self { config: None, connection_attempt: 0, connection : None }))
+        Arc::new(Mutex::new(
+            Self {
+                config: None,
+                connection_attempt: 0,
+                connection : None,
+                exchanges: Arc::new(RwLock::new(HashMap::new())),
+            }))
     }
-
-
 
     /// Connect to the rabbitmq server.
     /// The singleton must be configured before the first use.
@@ -89,11 +101,17 @@ impl Comms {
                 }
             }
         }
-
-
-
-
     }
+
+    /// Declare exchange
+    pub async fn declare_exchange(exchange: String, declare: DeclareExchange) {
+        let this = Self::get();
+        let this = this.lock().await;
+        let mut exchanges = this.exchanges.write().await;
+        exchanges.insert(exchange, declare);
+    }
+
+
 
     /// Creates a channel. This will only return the channel if the connection is valid, otherwise will
     /// wait to get the connection, or fail for misconfigured connection.
@@ -136,8 +154,10 @@ impl Comms {
             } else {
                 continue;
             };
+            let exchanges = this.exchanges.clone();
+            drop(this);
             log::trace!("Running creator on rabbit");
-            match creator(channel).await {
+            match creator(channel, exchanges).await {
                 Ok(obj) => return (creator, obj),
                 Err(err) => {
                     log::error!("Failed to create an object: {}", err);
@@ -205,5 +225,15 @@ impl Comms {
         }
 
         SINGLETON.clone()
+    }
+
+    pub(crate) async fn create_exchange(channel: Arc<Mutex<Channel>>, exchange: &str) -> anyhow::Result<()> {
+        let this = Self::get();
+        let this = this.lock().await;
+        let exchanges = this.exchanges.read().await;
+        if let Some(declare) = exchanges.get(exchange) {
+            declare(channel).await?;
+        }
+        Ok(())
     }
 }

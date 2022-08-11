@@ -23,6 +23,8 @@ pub mod config;
 pub mod comms;
 pub mod consumer;
 
+pub mod exchanges;
+
 pub mod publisher;
 
 pub mod auto_ack;

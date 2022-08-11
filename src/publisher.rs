@@ -113,7 +113,13 @@ impl<Item, Address> PublishWrapper<Item, Address> {
             loop {
                 {
                     let (publish, id) = {
+                        if let Err(err) = Comms::create_exchange(channel.clone(), exchange.as_ref()).await {
+                            log::error!("Error creating an exchange {:?}", err);
+                            std::process::exit(1);
+                        }
                         let channel = channel.lock().await;
+                        // let exchanges = Comms::get_exchanges().await;
+                        // let exchanges = exchanges.read().await;
                         (channel.basic_publish(
                             exchange.as_ref(),
                             routing_key.as_ref(),
