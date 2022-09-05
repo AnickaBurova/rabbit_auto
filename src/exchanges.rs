@@ -3,7 +3,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use futures::lock::Mutex;
 use lapin::{Channel, ExchangeKind};
-use lapin::options::{ExchangeDeclareOptions, ExchangeDeleteOptions};
+pub use lapin::options::{ExchangeDeclareOptions, ExchangeDeleteOptions};
 use lapin::types::FieldTable;
 use crate::comms::Comms;
 
