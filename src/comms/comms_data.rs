@@ -56,6 +56,7 @@ impl Data {
             }
         }
         self.current_channel_index = 0;
+        log::warn!("Closing rabbit connection");
         self.connection.close(0, "Restarting connection").await?;
         Ok(())
     }

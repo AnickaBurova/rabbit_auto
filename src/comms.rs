@@ -34,6 +34,7 @@ pub struct Comms {
     exchanges: Arc<RwLock<HashMap<String, DeclareExchange>>>,
     /// The connection
     connection: Option<Data>,
+    should_sleep: bool,
 }
 
 
@@ -46,6 +47,7 @@ impl Comms {
                 connection_attempt: 0,
                 connection : None,
                 exchanges: Arc::new(RwLock::new(HashMap::new())),
+                should_sleep: false,
             }))
     }
 
@@ -56,6 +58,7 @@ impl Comms {
     /// The default behaviour is, it will only finish if the connection is establish, otherwise this
     /// will not finish and will wait for connection.
     async fn connect() {
+        log::info!("Connecting to rabbitmq server");
         let this = Self::get();
         let mut this = this.lock().await;
         if let Some(con) = this.connection.as_ref() {
@@ -69,35 +72,78 @@ impl Comms {
         } else {
             log::trace!("Connection is invalid, trying to connect");
         }
-        let config = if let Some(config) = this.config.as_ref() {
-            config
-        } else {
+        // stop the current connection if any
+        if let Some(con) = this.connection.as_mut() {
+            if let Err(err) = con.close().await {
+                log::error!("Failed to close connection: {}", err);
+            }
+        }
+        if this.config.is_none() {
             log::error!("Auto rabbit was not initialised calling `Comms::configure`");
             std::process::exit(-1);
         };
-        loop {
+
+        let executor = this.config.as_ref().unwrap().executor.clone();
+        let reactor = this.config.as_ref().unwrap().reactor.clone();
+
+        if this.should_sleep {
+            this.should_sleep = false;
+            log::trace!("Going to sleep for {:?}", this.config.as_ref().unwrap().reconnect_delay);
+            reactor.sleep(this.config.as_ref().unwrap().reconnect_delay).await;
+        }
+
+        {
             log::trace!("Connecting to the rabbitmq");
+
             let mut properties =
-                ConnectionProperties::default().with_connection_name(config.name.clone().into());
+                ConnectionProperties::default().with_connection_name(this.config.as_ref().unwrap().name.clone().into());
+            properties.executor = Some(executor.clone());
+            properties.reactor = Some(reactor.clone());
             properties
                 .client_properties
                 .insert("channel_max".into(), AMQPValue::ShortUInt(comms_data::MAX_CHANNELS as ShortUInt));
 
-            let addr = &config.address[this.connection_attempt % config.address.len()];
-            let con = Connection::connect(addr, properties).await;
+            let addr = this.config.as_ref().unwrap().address[this.connection_attempt % this.config.as_ref().unwrap().address.len()].clone();
+            let con = Connection::connect(&addr, properties).await;
+            // let ( con, promise) = PinkySwear::<lapin::Result<Connection>>::new();
+            // executor.spawn(Box::pin(async move{
+            //     let addr = addr.as_ref();
+            //     let connector = Connection::connect(addr, properties);
+            //     let con = connector.await;
+            //     promise.swear(con);
+            // }));
+
             match con {
                 Ok(connection) => {
                     log::trace!("Connected");
                     this.connection = Some(Data::new(connection));
-                    return;
                 }
                 Err(err) => {
                     log::error!("Failed to connect: {}", err);
+                    this.should_sleep = true;
                     // wait a second, and try to connect again
-                    #[cfg(feature = "tokio_runtime")]
-                    tokio::time::sleep(config.reconnect_delay).await;
-                    #[cfg(feature = "async_std_runtime")]
-                    async_std::task::sleep(config.reconnect_delay).await;
+                    // #[cfg(feature = "tokio_runtime")]
+                    // {
+                    //     // let executor = tokio_executor_trait::Tokio::current();
+                    //     // executor.spawn(Box::pin(async move {
+                    //     //     let mut counter = 0;
+                    //     //     while counter < 10 {
+                    //     //         log::info!("Spawned debug counter: {}", counter);
+                    //     //         tokio_reactor_trait::Tokio.sleep(std::time::Duration::from_secs(1)).await;
+                    //     //         counter += 1;
+                    //     //     }
+                    //     // }));
+                    //     log::trace!("Using tokio runtime");
+                    //
+                    //     tokio_reactor_trait::Tokio.sleep(config.reconnect_delay).await;
+                    //     // tokio::time::sleep(config.reconnect_delay).await;
+                    // }
+                    // #[cfg(feature = "async_std_runtime")]
+                    // {
+                    //     log::trace!("Using async std runtime");
+                    //     async_std::task::sleep(config.reconnect_delay).await;
+                    // }
+                    log::trace!("Trying again");
                 }
             }
         }
