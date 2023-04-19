@@ -9,8 +9,7 @@ use futures::{
     Sink,
 };
 use std::collections::VecDeque;
-use std::sync::Arc;
-use futures::lock::Mutex;
+use std::sync::{Arc, Weak};
 use crate::comms::Comms;
 use lapin::options::{ConfirmSelectOptions, BasicPublishOptions};
 pub mod publisher_properties;
@@ -23,7 +22,7 @@ pub type GetBPO = Pin<Box<dyn Fn() -> BasicPublishOptions + Send + Sync>>;
 pub type GetBP = Pin<Box<dyn Fn() -> BasicProperties + Send + Sync>>;
 
 
-type Data<E> = (Arc<Mutex<Channel>>, E, Option<GetCSO>, Option<GetBPO>, Option<GetBP>);
+type Data<E> = (Weak<Channel>, E, Option<GetCSO>, Option<GetBPO>, Option<GetBP>);
 
 mod serialise;
 pub use serialise::Serialise;
@@ -37,7 +36,7 @@ pub fn simple_confirm_options() -> GetCSO {
 enum State<Item, Address>
 {
     Idle {
-        channel: Arc<Mutex<Channel>>,
+        channel: Weak<Channel>,
         address: Address,
         confirm: Option<GetCSO>,
         publish_options: Option<GetBPO>,
@@ -58,7 +57,7 @@ pub struct PublishWrapper<Item, Address>
 }
 
 impl<Item, Address> PublishWrapper<Item, Address> {
-    async fn connect() -> Arc<Mutex<Channel>> {
+    async fn connect() -> Arc<Channel> {
         Comms::create_channel().await
     }
 
@@ -75,9 +74,8 @@ impl<Item, Address> PublishWrapper<Item, Address> {
         Ok(())
     }
 
-    async fn set_channel(channel: Arc<Mutex<Channel>>, confirm: Option<GetCSO>) -> std::result::Result<(Arc<Mutex<Channel>>, Option<GetCSO>), (anyhow::Error, Option<GetCSO>)> {
+    async fn set_channel(channel: Arc<Channel>, confirm: Option<GetCSO>) -> std::result::Result<(Arc<Channel>, Option<GetCSO>), (anyhow::Error, Option<GetCSO>)> {
         let confirm = if let Some(confirm) = confirm {
-            let channel = channel.lock().await;
             if let Err(err) = channel
                 .confirm_select(confirm())
                 .await {
@@ -92,7 +90,7 @@ impl<Item, Address> PublishWrapper<Item, Address> {
 
     async fn send<T, E,K, D, R>(
             item: T,
-            mut channel: Arc<Mutex<Channel>>,
+            mut channel: Weak<Channel>,
             exchange: E,
             routing_key: K,
             mut confirm: Option<GetCSO>,
@@ -103,7 +101,7 @@ impl<Item, Address> PublishWrapper<Item, Address> {
             where T: Unpin + Send + Serialise,
                   E: AsRef<str> + Send + Unpin + 'static,
                   K: AsRef<str> + Send + Unpin + 'static,
-                  R: FnOnce(Arc<Mutex<Channel>>, E, K, Option<GetCSO>, Option<GetBPO>, Option<GetBP>) -> Data<D>,
+                  R: FnOnce(Weak<Channel>, E, K, Option<GetCSO>, Option<GetBPO>, Option<GetBP>) -> Data<D>,
         {
             let data = T::serialise(&item);
             if data.as_ref().is_empty()  {
@@ -113,11 +111,17 @@ impl<Item, Address> PublishWrapper<Item, Address> {
             loop {
                 {
                     let (publish, id) = {
+                        let channel = if let Some(ch) = channel.upgrade() {
+                            ch
+                        } else {
+                            let ch = Self::connect().await;
+                            channel = Arc::downgrade(&ch);
+                            ch
+                        };
                         if let Err(err) = Comms::create_exchange(channel.clone(), exchange.as_ref()).await {
                             log::error!("Error creating an exchange {:?}", err);
                             std::process::exit(1);
                         }
-                        let channel = channel.lock().await;
                         // let exchanges = Comms::get_exchanges().await;
                         // let exchanges = exchanges.read().await;
                         (channel.basic_publish(
@@ -166,7 +170,7 @@ impl<Item, Address> PublishWrapper<Item, Address> {
                     // here we can unwrap, because the connect should never fail if it succeeded once
                     match Self::set_channel(Self::connect().await, confirm).await {
                         Ok((value, con)) => {
-                            channel = value;
+                            channel = Arc::downgrade(&value);
                             confirm = con;
                             break;
                         }
@@ -316,7 +320,7 @@ impl<T,E,K> PublishWrapper<T, (E, K)>
                     continue;
                 }
             };
-            return Self { state: Some(State::Idle { channel, address: (exchange, routing_key), confirm, publish_options, publish_properties, queue: VecDeque::new() } )};
+            return Self { state: Some(State::Idle { channel: Arc::downgrade(&channel), address: (exchange, routing_key), confirm, publish_options, publish_properties, queue: VecDeque::new() } )};
         }
     }
 }
@@ -346,7 +350,7 @@ impl<T,E,K> PublishWrapper<(T,K), E>
                     continue;
                 }
             };
-            return Self { state: Some(State::Idle { channel, address: exchange, confirm, publish_options, publish_properties, queue: VecDeque::new() }) };
+            return Self { state: Some(State::Idle { channel: Arc::downgrade(&channel), address: exchange, confirm, publish_options, publish_properties, queue: VecDeque::new() }) };
         }
     }
 }

@@ -19,7 +19,7 @@ use crate::exchanges::DeclareExchange;
 /// Result of the creator function
 pub type CreatorResult<T> = Pin<Box<dyn Future<Output = anyhow::Result<T>> + Send>>;
 /// Creator function
-pub type Creator<T> = Pin<Box<dyn Fn(Arc<Mutex<Channel>>, Arc<RwLock<HashMap<String, DeclareExchange>>>) -> CreatorResult<T> + Send + Sync>>;
+pub type Creator<T> = Pin<Box<dyn Fn(Arc<Channel>, Arc<RwLock<HashMap<String, DeclareExchange>>>) -> CreatorResult<T> + Send + Sync>>;
 
 
 
@@ -34,7 +34,7 @@ pub struct Comms {
     exchanges: Arc<RwLock<HashMap<String, DeclareExchange>>>,
     /// The connection
     connection: Option<Data>,
-    should_sleep: bool,
+    // should_sleep: bool,
 }
 
 
@@ -47,7 +47,7 @@ impl Comms {
                 connection_attempt: 0,
                 connection : None,
                 exchanges: Arc::new(RwLock::new(HashMap::new())),
-                should_sleep: false,
+                // should_sleep: false,
             }))
     }
 
@@ -78,32 +78,32 @@ impl Comms {
                 log::error!("Failed to close connection: {}", err);
             }
         }
-        if this.config.is_none() {
+        let config = if let Some(config) = this.config.as_ref() {
+            config
+        } else {
             log::error!("Auto rabbit was not initialised calling `Comms::configure`");
             std::process::exit(-1);
         };
 
-        let executor = this.config.as_ref().unwrap().executor.clone();
-        let reactor = this.config.as_ref().unwrap().reactor.clone();
+        let executor = config.executor.clone();
+        let reactor = config.reactor.clone();
 
-        if this.should_sleep {
-            this.should_sleep = false;
-            log::trace!("Going to sleep for {:?}", this.config.as_ref().unwrap().reconnect_delay);
-            reactor.sleep(this.config.as_ref().unwrap().reconnect_delay).await;
-        }
+        // if this.should_sleep {
+        //     this.should_sleep = false;
+        // }
 
-        {
+        loop {
             log::trace!("Connecting to the rabbitmq");
 
             let mut properties =
-                ConnectionProperties::default().with_connection_name(this.config.as_ref().unwrap().name.clone().into());
+                ConnectionProperties::default().with_connection_name(config.name.clone().into());
             properties.executor = Some(executor.clone());
             properties.reactor = Some(reactor.clone());
             properties
                 .client_properties
                 .insert("channel_max".into(), AMQPValue::ShortUInt(comms_data::MAX_CHANNELS as ShortUInt));
 
-            let addr = this.config.as_ref().unwrap().address[this.connection_attempt % this.config.as_ref().unwrap().address.len()].clone();
+            let addr = config.address[this.connection_attempt % config.address.len()].clone();
             let con = Connection::connect(&addr, properties).await;
             // let ( con, promise) = PinkySwear::<lapin::Result<Connection>>::new();
             // executor.spawn(Box::pin(async move{
@@ -117,10 +117,13 @@ impl Comms {
                 Ok(connection) => {
                     log::trace!("Connected");
                     this.connection = Some(Data::new(connection));
+                    return;
                 }
                 Err(err) => {
                     log::error!("Failed to connect: {}", err);
-                    this.should_sleep = true;
+                    log::trace!("Going to sleep for {:?}", config.reconnect_delay);
+                    reactor.sleep(config.reconnect_delay).await;
+                    // this.should_sleep = true;
                     // wait a second, and try to connect again
                     // #[cfg(feature = "tokio_runtime")]
                     // {
@@ -161,7 +164,7 @@ impl Comms {
 
     /// Creates a channel. This will only return the channel if the connection is valid, otherwise will
     /// wait to get the connection, or fail for misconfigured connection.
-    pub async fn create_channel() -> Arc<Mutex<Channel>> {
+    pub async fn create_channel() -> Arc<Channel> {
         loop {
             Self::connect().await;
             let this = Comms::get();
@@ -273,7 +276,7 @@ impl Comms {
         SINGLETON.clone()
     }
 
-    pub(crate) async fn create_exchange(channel: Arc<Mutex<Channel>>, exchange: &str) -> anyhow::Result<()> {
+    pub(crate) async fn create_exchange(channel: Arc<Channel>, exchange: &str) -> anyhow::Result<()> {
         let this = Self::get();
         let this = this.lock().await;
         let exchanges = this.exchanges.read().await;

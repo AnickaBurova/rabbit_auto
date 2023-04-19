@@ -1,6 +1,5 @@
 use lapin::{Channel, Connection, ConnectionStatus};
-use std::sync::Arc;
-use futures::lock::Mutex;
+use std::sync::{Arc};
 
 pub const MAX_CHANNELS: usize = 8;
 
@@ -8,7 +7,7 @@ pub struct Data {
     /// The actual connection to the rabbit
     connection: Connection,
     /// Precreated channel to use, this will not go over MAX_CHANNELS
-    channels: Vec<Arc<Mutex<Channel>>>,
+    channels: Vec<Arc<Channel>>,
     /// The current index of the channel to return.
     /// Creating channel will go around `channels` in a circle up to MAX_CHANNELS
     current_channel_index: usize,
@@ -30,7 +29,7 @@ impl Data {
     }
 
     /// Create a channel, or take one already created from a ring buffer
-    pub async fn create_channel(&mut self) -> anyhow::Result<Arc<Mutex<Channel>>> {
+    pub async fn create_channel(&mut self) -> anyhow::Result<Arc<Channel>> {
         let index = self.current_channel_index;
         self.current_channel_index += 1;
         if self.current_channel_index > MAX_CHANNELS {
@@ -38,7 +37,7 @@ impl Data {
         }
         if self.channels.len() < index + 1 {
             log::trace!("Creating a new channel: {}", self.channels.len());
-            let channel = Arc::new(Mutex::new(self.connection.create_channel().await?));
+            let channel = Arc::new(self.connection.create_channel().await?);
             self.channels.push(channel.clone());
             Ok(channel)
         } else {
@@ -49,7 +48,6 @@ impl Data {
 
     pub async fn close(&mut self) -> anyhow::Result<()> {
         for channel in self.channels.drain(..) {
-            let channel = channel.lock().await;
 
             if let Err(err) = channel.close(0, "restarting connection").await {
                 log::error!("Failed to close a channel: {}", err);

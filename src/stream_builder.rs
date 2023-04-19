@@ -9,7 +9,6 @@ use crate::auto_ack::{AutoAck, auto_ack};
 use lapin::Channel;
 use crate::consumer::ConsumerWrapper;
 use anyhow::Result;
-use futures::lock::Mutex;
 use lapin::acker::Acker;
 use lapin::message::Delivery;
 use lapin::options::QueueDeleteOptions;
@@ -51,7 +50,7 @@ impl<Q, T,K,E> StreamBuilderWithName<Q, T, K, E>
 {
     /// Creates a consumer which returns channel and the delivery.
     pub async fn create_plain(self) -> impl StreamExt<Item = Delivery> + Unpin + Send {
-        let consumer = ConsumerWrapper::new(Box::pin(move |channel: Arc<Mutex<Channel>>, exchanges: Arc<RwLock<HashMap<String, DeclareExchange>>>| {
+        let consumer = ConsumerWrapper::new(Box::pin(move |channel: Arc<Channel>, exchanges: Arc<RwLock<HashMap<String, DeclareExchange>>>| {
             // log::trace!("Declaring rabbit '{}' queue", stringify!($item));
             let this = self.clone();
             Box::pin(async move {
@@ -62,7 +61,6 @@ impl<Q, T,K,E> StreamBuilderWithName<Q, T, K, E>
                         log::trace!("Declaring exchange: {}", this.exchange.as_ref());
                         (*declare_exchange)(channel.clone()).await?;
                     }
-                    let channel = channel.lock().await;
                     if let Some((qos, options)) = this.qos {
                         channel.basic_qos(qos,
                                           options.unwrap_or_else(|| lapin::options::BasicQosOptions::default())
@@ -79,7 +77,6 @@ impl<Q, T,K,E> StreamBuilderWithName<Q, T, K, E>
                                           this.declare_fields.unwrap_or_else(|| lapin::types::FieldTable::default()),
                     ).await {
                         let channel = Comms::create_channel().await;
-                        let channel = channel.lock().await;
                         log::warn!("Deleting incompatible queue: {}", err);
                         if this.incompatible_delete {
                             let msgs = channel.queue_delete(queue_name, QueueDeleteOptions {

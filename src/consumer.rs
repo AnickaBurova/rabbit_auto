@@ -5,7 +5,7 @@ use tokio::sync::RwLock;
 #[cfg(feature = "async_std_runtime")]
 use async_std::sync::RwLock;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use futures::{
     future::Future,
     stream::Stream,
@@ -13,16 +13,15 @@ use futures::{
 };
 use lapin::{message::Delivery, Channel, Consumer};
 use anyhow::Result;
-use futures::lock::Mutex;
 use crate::exchanges::DeclareExchange;
 
 use super::comms::*;
 
 /// Returns a future which creates the consumer from the provided channel.
-pub type ConsumerCreator = Creator<(Arc<Mutex<Channel>>, Consumer)>;
+pub type ConsumerCreator = Creator<(Arc<Channel>, Consumer)>;
 
 pub type CreatorResult<T> = Pin<Box<dyn Future<Output = Result<T>> + Send>>;
-pub type Creator<T> = Pin<Box<dyn Fn(Arc<Mutex<Channel>>, Arc<RwLock<HashMap<String, DeclareExchange>>>) -> CreatorResult<T> + Send + Sync>>;
+pub type Creator<T> = Pin<Box<dyn Fn(Arc<Channel>, Arc<RwLock<HashMap<String, DeclareExchange>>>) -> CreatorResult<T> + Send + Sync>>;
 
 type NextFuture = Pin<
     Box<
@@ -30,7 +29,7 @@ type NextFuture = Pin<
             Output = (
                 Delivery,
                 Consumer,
-                Arc<Mutex<Channel>>,
+                Weak<Channel>,
                 ConsumerCreator,
             ),
         > + Send,
@@ -44,7 +43,7 @@ enum State {
         consumer: Consumer,
         /// RabbitMQ channel, this has to be keep here for having the consumer alive, otherwise there will
         /// be non channel alive for the consumer, and the consumer would be dropped.
-        channel: Arc<Mutex<Channel>>,
+        channel: Weak<Channel>,
         /// Creator of the consumer
         creator: ConsumerCreator,
     },
@@ -74,7 +73,7 @@ impl ConsumerWrapper {
     pub async fn new(creator: ConsumerCreator) -> Self {
         let (creator, (channel, consumer)) = Self::connect(creator).await;
         log::debug!("Consumer wrapper created");
-        Self { state: Some(State::Idle { consumer, channel, creator })}
+        Self { state: Some(State::Idle { consumer, channel: Arc::downgrade(&channel), creator })}
     }
 
     /// Connects to the rabbit by passing the creator function
@@ -87,15 +86,15 @@ impl ConsumerWrapper {
     async fn connect(
         creator: ConsumerCreator,
     ) -> (
-        Creator<(Arc<Mutex<Channel>>, Consumer)>,
-        (Arc<Mutex<Channel>>, Consumer),
+        Creator<(Arc<Channel>, Consumer)>,
+        (Arc<Channel>, Consumer),
     ) {
-        Comms::create_object::<(Arc<Mutex<Channel>>, Consumer)>(creator).await
+        Comms::create_object::<(Arc<Channel>, Consumer)>(creator).await
     }
 
     /// Gets the next item from the consumer. If the consumer is broken, then a new consumer is automatically created
-    async fn next_item(mut consumer: Consumer, mut channel: Arc<Mutex<Channel>>, mut creator: ConsumerCreator)
-        -> (Delivery, Consumer, Arc<Mutex<Channel>>, ConsumerCreator) {
+    async fn next_item(mut consumer: Consumer, mut channel: Weak<Channel>, mut creator: ConsumerCreator)
+        -> (Delivery, Consumer, Weak<Channel>, ConsumerCreator) {
         loop {
             use futures::stream::StreamExt;
             log::debug!("Polling consumer");
@@ -115,7 +114,7 @@ impl ConsumerWrapper {
             let (cr, (chan, cons)) = Self::connect(creator).await;
             creator = cr;
             consumer = cons;
-            channel = chan;
+            channel = Arc::downgrade(&chan);
         }
     }
 }
