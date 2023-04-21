@@ -50,14 +50,14 @@ impl<Q, T,K,E> StreamBuilderWithName<Q, T, K, E>
 {
     /// Creates a consumer which returns channel and the delivery.
     pub async fn create_plain(self) -> impl StreamExt<Item = Delivery> + Unpin + Send {
-        let consumer = ConsumerWrapper::new(Box::pin(move |channel: Arc<Channel>, exchanges: Arc<RwLock<HashMap<String, DeclareExchange>>>| {
+        let consumer = ConsumerWrapper::new(self.exchange.clone(), Box::pin(move |channel: Arc<Channel>, exchange: Option<Arc<DeclareExchange>>| {
             // log::trace!("Declaring rabbit '{}' queue", stringify!($item));
+            // TODO: do we need to clone this?
             let this = self.clone();
             Box::pin(async move {
                 let consumer = {
                     log::trace!("Declare exchange if needed");
-                    let exchanges = exchanges.read().await;
-                    if let Some(declare_exchange) = exchanges.get(this.exchange.as_ref()) {
+                    if let Some(declare_exchange) = exchange {
                         log::trace!("Declaring exchange: {}", this.exchange.as_ref());
                         (*declare_exchange)(channel.clone()).await?;
                     }

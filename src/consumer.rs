@@ -21,13 +21,14 @@ use super::comms::*;
 pub type ConsumerCreator = Creator<(Arc<Channel>, Consumer)>;
 
 pub type CreatorResult<T> = Pin<Box<dyn Future<Output = Result<T>> + Send>>;
-pub type Creator<T> = Pin<Box<dyn Fn(Arc<Channel>, Arc<RwLock<HashMap<String, DeclareExchange>>>) -> CreatorResult<T> + Send + Sync>>;
+pub type Creator<T> = Pin<Box<dyn Fn(Arc<Channel>, Option<Arc<DeclareExchange>>) -> CreatorResult<T> + Send + Sync>>;
 
-type NextFuture = Pin<
+type NextFuture<E> = Pin<
     Box<
         dyn Future<
             Output = (
                 Delivery,
+                E,
                 Consumer,
                 Weak<Channel>,
                 ConsumerCreator,
@@ -36,9 +37,10 @@ type NextFuture = Pin<
     >,
 >;
 
-enum State {
+enum State<E> {
     /// Waiting to start looking for the next item
     Idle {
+        exchange: E,
         /// RabbitMQ consumer
         consumer: Consumer,
         /// RabbitMQ channel, this has to be keep here for having the consumer alive, otherwise there will
@@ -50,7 +52,7 @@ enum State {
     /// Looking for the next item
     Next {
         /// Future to get the next item
-        next: NextFuture,
+        next: NextFuture<E>,
     }
 }
 
@@ -58,11 +60,15 @@ enum State {
 /// finishing the stream, the wrapper will try to reconnect and recreate the connection and continue
 /// consuming like nothing happened. But if the connection was never established at least once, the stream
 /// end right away!
-pub struct ConsumerWrapper {
-    state: Option<State>,
+pub struct ConsumerWrapper<E> {
+    state: Option<State<E>>,
 }
 
-impl ConsumerWrapper {
+impl<E> ConsumerWrapper<E>
+where
+    E: AsRef<str> + Send + Unpin + 'static + Clone + Sync,
+{
+
     /// Create a new consumer by providing a creator function. This function might be called many times,
     /// as often as we loose connection to the rabbitmq.
     // pub async fn new(creator: ConsumerCreator) -> Result<Self> {
@@ -70,10 +76,10 @@ impl ConsumerWrapper {
     //     log::debug!("Consumer wrapper created");
     //     Ok(Self { state: Some(State::Idle { consumer, channel, creator }) })
     // }
-    pub async fn new(creator: ConsumerCreator) -> Self {
-        let (creator, (channel, consumer)) = Self::connect(creator).await;
+    pub async fn new(exchange: E, creator: ConsumerCreator) -> Self {
+        let (creator, (channel, consumer)) = Self::connect(exchange.as_ref(), creator).await;
         log::debug!("Consumer wrapper created");
-        Self { state: Some(State::Idle { consumer, channel: Arc::downgrade(&channel), creator })}
+        Self { state: Some(State::Idle { exchange, consumer, channel: Arc::downgrade(&channel), creator })}
     }
 
     /// Connects to the rabbit by passing the creator function
@@ -84,24 +90,25 @@ impl ConsumerWrapper {
     // }
 
     async fn connect(
+        exchange: &str,
         creator: ConsumerCreator,
     ) -> (
         Creator<(Arc<Channel>, Consumer)>,
         (Arc<Channel>, Consumer),
     ) {
-        Comms::create_object::<(Arc<Channel>, Consumer)>(creator).await
+        Comms::create_object::<(Arc<Channel>, Consumer)>(exchange, creator).await
     }
 
     /// Gets the next item from the consumer. If the consumer is broken, then a new consumer is automatically created
-    async fn next_item(mut consumer: Consumer, mut channel: Weak<Channel>, mut creator: ConsumerCreator)
-        -> (Delivery, Consumer, Weak<Channel>, ConsumerCreator) {
+    async fn next_item(exchange: E, mut consumer: Consumer, mut channel: Weak<Channel>, mut creator: ConsumerCreator)
+        -> (Delivery, E, Consumer, Weak<Channel>, ConsumerCreator) {
         loop {
             use futures::stream::StreamExt;
             log::debug!("Polling consumer");
             match consumer.next().await {
                 Some(Ok(delivery)) => {
                     log::debug!("Got delivery");
-                    return (delivery, consumer, channel, creator);
+                    return (delivery, exchange, consumer, channel, creator);
                 }
                 Some(Err(err)) => {
                     log::error!("Failed to consume a message: {}", err);
@@ -111,7 +118,7 @@ impl ConsumerWrapper {
                 }
             }
             log::warn!("Recreating the consumer");
-            let (cr, (chan, cons)) = Self::connect(creator).await;
+            let (cr, (chan, cons)) = Self::connect(exchange.as_ref(), creator).await;
             creator = cr;
             consumer = cons;
             channel = Arc::downgrade(&chan);
@@ -119,7 +126,10 @@ impl ConsumerWrapper {
     }
 }
 
-impl Stream for ConsumerWrapper {
+impl<E> Stream for ConsumerWrapper<E>
+    where
+        E: AsRef<str> + Send + Unpin + 'static + Clone + Sync,
+{
     type Item = Delivery;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
         log::debug!("Poll next");
@@ -127,9 +137,9 @@ impl Stream for ConsumerWrapper {
 
         loop {
             match this.state.take() {
-                Some(State::Idle { consumer, channel, creator }) => {
+                Some(State::Idle { exchange, consumer, channel, creator }) => {
                     this.state = Some(State::Next {
-                        next: Box::pin(Self::next_item(consumer, channel, creator)),
+                        next: Box::pin(Self::next_item( exchange, consumer, channel, creator)),
                     });
                 }
                 Some(State::Next { mut next }) => {
@@ -140,8 +150,8 @@ impl Stream for ConsumerWrapper {
                             log::debug!("Pending");
                             Poll::Pending
                         }
-                        Poll::Ready((delivery, consumer, channel, creator)) => {
-                            this.state = Some(State::Idle { consumer, channel, creator });
+                        Poll::Ready((delivery, exchange,  consumer, channel, creator)) => {
+                            this.state = Some(State::Idle { exchange, consumer, channel, creator });
                             log::debug!("Ready");
                             Poll::Ready(Some(delivery))
                         }

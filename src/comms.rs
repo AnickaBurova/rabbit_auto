@@ -19,7 +19,7 @@ use crate::exchanges::DeclareExchange;
 /// Result of the creator function
 pub type CreatorResult<T> = Pin<Box<dyn Future<Output = anyhow::Result<T>> + Send>>;
 /// Creator function
-pub type Creator<T> = Pin<Box<dyn Fn(Arc<Channel>, Arc<RwLock<HashMap<String, DeclareExchange>>>) -> CreatorResult<T> + Send + Sync>>;
+pub type Creator<T> = Pin<Box<dyn Fn(Arc<Channel>, Option<Arc<DeclareExchange>>) -> CreatorResult<T> + Send + Sync>>;
 
 
 
@@ -31,7 +31,8 @@ pub struct Comms {
     config: Option<Config>,
     /// Counter
     connection_attempt: usize,
-    exchanges: Arc<RwLock<HashMap<String, DeclareExchange>>>,
+    // exchanges: Arc<RwLock<HashMap<String, DeclareExchange>>>,
+    exchanges: HashMap<String, Arc<DeclareExchange>>,
     /// The connection
     connection: Option<Data>,
     // should_sleep: bool,
@@ -46,7 +47,7 @@ impl Comms {
                 config: None,
                 connection_attempt: 0,
                 connection : None,
-                exchanges: Arc::new(RwLock::new(HashMap::new())),
+                exchanges: HashMap::new(),
                 // should_sleep: false,
             }))
     }
@@ -59,8 +60,8 @@ impl Comms {
     /// will not finish and will wait for connection.
     async fn connect() {
         log::info!("Connecting to rabbitmq server");
-        let this = Self::get();
-        let mut this = this.lock().await;
+        let singleton = Self::get();
+        let mut this = singleton.lock().await;
         if let Some(con) = this.connection.as_ref() {
             log::trace!("Testing validity of the rabbit connection");
             let status = con.get_status();
@@ -91,10 +92,12 @@ impl Comms {
         // if this.should_sleep {
         //     this.should_sleep = false;
         // }
+        drop(this);
 
         loop {
             log::trace!("Connecting to the rabbitmq");
-
+            let this = singleton.lock().await;
+            let config = this.config.as_ref().unwrap();
             let mut properties =
                 ConnectionProperties::default().with_connection_name(config.name.clone().into());
             properties.executor = Some(executor.clone());
@@ -104,6 +107,7 @@ impl Comms {
                 .insert("channel_max".into(), AMQPValue::ShortUInt(comms_data::MAX_CHANNELS as ShortUInt));
 
             let addr = config.address[this.connection_attempt % config.address.len()].clone();
+            drop(this);
             let con = Connection::connect(&addr, properties).await;
             // let ( con, promise) = PinkySwear::<lapin::Result<Connection>>::new();
             // executor.spawn(Box::pin(async move{
@@ -153,11 +157,15 @@ impl Comms {
     }
 
     /// Declare exchange
-    pub async fn declare_exchange(exchange: String, declare: DeclareExchange) {
+    pub async fn declare_exchange(exchange: String, declare: DeclareExchange) -> anyhow::Result<()> {
         let this = Self::get();
-        let this = this.lock().await;
-        let mut exchanges = this.exchanges.write().await;
-        exchanges.insert(exchange, declare);
+        let mut this = this.lock().await;
+        if this.exchanges.contains_key(&exchange) {
+            anyhow::bail!("Exchange {} already declared", exchange);
+        }
+        // let mut exchanges = this.exchanges.write().await;
+        this.exchanges.insert(exchange, Arc::new(declare));
+        Ok(())
     }
 
 
@@ -185,7 +193,7 @@ impl Comms {
     /// Creates and object on a freshly created channel.
     /// ***creator*** arguments is called with the channel, and the ***creator*** handles the
     /// creation of the object.
-    pub async fn create_object<T: Send>(creator: Creator<T>) -> (Creator<T>, T) {
+    pub async fn create_object< T: Send >(exchange: &str, creator: Creator<T>) -> (Creator<T>, T) {
         loop {
             Self::connect().await;
             let this = Comms::get();
@@ -203,10 +211,10 @@ impl Comms {
             } else {
                 continue;
             };
-            let exchanges = this.exchanges.clone();
+            let exchange = this.exchanges.get(exchange).map(|e|e.clone());
             drop(this);
             log::trace!("Running creator on rabbit");
-            match creator(channel, exchanges).await {
+            match creator(channel, exchange).await {
                 Ok(obj) => return (creator, obj),
                 Err(err) => {
                     log::error!("Failed to create an object: {}", err);
@@ -279,8 +287,7 @@ impl Comms {
     pub(crate) async fn create_exchange(channel: Arc<Channel>, exchange: &str) -> anyhow::Result<()> {
         let this = Self::get();
         let this = this.lock().await;
-        let exchanges = this.exchanges.read().await;
-        if let Some(declare) = exchanges.get(exchange) {
+        if let Some(declare) = this.exchanges.get(exchange) {
             declare(channel).await?;
         }
         Ok(())
