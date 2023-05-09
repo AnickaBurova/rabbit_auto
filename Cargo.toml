@@ -5,6 +5,7 @@ authors = ["Anicka Burova <anicka.burova@gmail.com>"]
 edition = "2018"
 license = "MIT"
 description = "Wrappers for lapin publishers and consumers"
+repository = "https://github.com/AnickaBurova/rabbit_auto"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [features]
