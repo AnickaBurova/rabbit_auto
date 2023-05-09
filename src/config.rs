@@ -8,15 +8,23 @@ use executor_trait::FullExecutor;
 use reactor_trait::Reactor;
 
 /// Configuration for the rabbitmq connection
-pub struct Config {
+pub struct Config<E, R>
+where
+    E: FullExecutor,
+    R: Reactor,
+{
     pub name: String,
     pub address: Vec<String>,
     pub reconnect_delay: Duration,
-    pub executor: Arc<dyn FullExecutor + Sync + Send>,
-    pub reactor: Arc<dyn Reactor + Sync + Send>,
+    pub executor: Arc<E>,
+    pub reactor: Arc<R>,
 }
 
-impl Config {
+impl<E, R> Config<E, R>
+    where
+        E: FullExecutor,
+        R: Reactor,
+{
     /// Creates a new configuration
     /// # Arguments:
     /// * host - the address to rabbitmq server
@@ -29,8 +37,8 @@ impl Config {
         user: &str,
         password: &str,
         reconnect_delay: Duration,
-        executor: Arc<dyn FullExecutor + Sync + Send>,
-        reactor: Arc<dyn Reactor + Sync + Send>,
+        executor: E,
+        reactor: R,
     ) -> Self {
         let mut address = Vec::new();
         for addr in host {
@@ -41,8 +49,8 @@ impl Config {
             name,
             address,
             reconnect_delay,
-            executor,
-            reactor,
+            executor: Arc::new(executor),
+            reactor: Arc::new(reactor),
         }
     }
 }

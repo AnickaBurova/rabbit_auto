@@ -1,7 +1,6 @@
 use lapin::{Channel, Connection, ConnectionStatus};
 use std::sync::{Arc};
 
-pub const MAX_CHANNELS: usize = 8;
 
 pub struct Data {
     /// The actual connection to the rabbit

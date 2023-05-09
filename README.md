@@ -3,6 +3,14 @@ The library provides a consumer and a publisher, which after the first successfu
 
 The current async runtime used is tokio, but it can be easily extended (in the library code) to use different ones.
 
+The version 0.3.0 has a bug which stops automatic reconnection.
+There is some deadlock, which I was not able to track, so I have refactored the whole process, and kept most of the interfaces unchanged.
+But the `configure` function has changed, and it is no longer async function. 
+At the moment the latest version only supports tokio.
+Config requires FullExecutor trait and Reactor trait.
+Using tokio-reactor-trait and tokio-executor-trait makes this easy.
+
+
 ```rust
 
 use rabbit_auto::publisher::{Serialise, PublishWrapper, simple_confirm_options};
@@ -10,9 +18,17 @@ use rabbit_auto::comms::Comms;
 use rabbit_auto::config::Config;
 
 /// If the configure is not called, the library will kill the app using `std::process::exit()`
-Comms::configure(Config::new("rabbit-host-ip", "rabbit user", "rabbit password",
-                            // reconnection interval when the connection is lost
-                            Duration::from_secs(3)).await;
+/// The configure function is no longer async!
+Comms::configure(Config::new(
+    "app-tag", // the tag of the application for the rabbitmq
+    "rabbit-host-ip",
+    "rabbit user",
+    "rabbit password",
+    // reconnection interval when the connection is lost
+    Duration::from_secs(3),
+    tokio_executor_trait::Tokio::current(),
+    tokio_reactor_trait::Tokio,
+);
 
 // Publisher Sink which expects the MsgOut and routing key String
 // the created publisher of type impl Sink<(MsgOut, String)> + Unpin,

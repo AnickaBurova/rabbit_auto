@@ -4,7 +4,6 @@ use std::sync::Arc;
 use lapin::{Channel, ExchangeKind};
 pub use lapin::options::{ExchangeDeclareOptions, ExchangeDeleteOptions};
 use lapin::types::FieldTable;
-use crate::comms::Comms;
 
 pub type DeclareExchange = Pin<Box<dyn Fn(Arc<Channel>) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> + Send + Sync>>;
 
@@ -18,11 +17,8 @@ pub fn create_exchange(exchange: String, kind: ExchangeKind, options: Option<Exc
             let backup_arguments = arguments.clone();
             let backup_options = options.clone();
             if let Err(err) = channel.exchange_declare(&exchange, kind.clone(), options.unwrap_or_else(|| ExchangeDeclareOptions::default()), arguments.unwrap_or_else(|| FieldTable::default())).await {
-                drop(channel);
                 log::error!("Failed to declare exchange: {}", err);
                 log::warn!("Deleting the old one and creating a new one");
-
-                let channel = Comms::create_channel().await;
 
                 match channel.exchange_delete(&exchange, ExchangeDeleteOptions { if_unused: false, nowait: true}).await {
                     Ok(()) => {
