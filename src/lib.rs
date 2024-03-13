@@ -30,3 +30,6 @@ pub mod publisher;
 pub mod auto_ack;
 
 pub mod stream_builder;
+
+
+pub mod publish_properties;

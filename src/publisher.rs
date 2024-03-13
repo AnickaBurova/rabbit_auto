@@ -215,7 +215,7 @@ impl <Item, Exchange, RoutingKey> Sink<(Item, RoutingKey)> for PublishWrapper<(I
     type Error = Error;
 
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
-        let mut this = Pin::into_inner(self);
+        let this = Pin::into_inner(self);
         loop {
             match this.state.take() {
                 Some(State::Sending(mut sender)) => {
@@ -272,7 +272,7 @@ where
     type Error = Error;
 
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
-        let mut this = Pin::into_inner(self);
+        let this = Pin::into_inner(self);
         loop {
             match this.state.take() {
                 Some(State::Sending(mut sender)) => {

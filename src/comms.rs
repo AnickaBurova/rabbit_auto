@@ -128,6 +128,7 @@ impl Comms {
             let mut declare_exchanges = HashMap::new();
 
             let mut channels = channels_ring::Channels::new();
+            let mut is_connecting = false;
             loop {
                 let mut channel_sender = None;
                 tokio::select!(
@@ -155,7 +156,12 @@ impl Comms {
                                 }
                                 ConnectionState::Connected => {
                                     // the connection is valid
-                                    log::info!("Rabbit is connected");
+                                    if is_connecting {
+                                        log::info!("Connection to RabbitMQ established");
+                                        is_connecting = false;
+                                    } else {
+                                        log::trace!("RabbitMQ is connected");
+                                    }
                                     if !declare_exchanges.is_empty() {
                                         match channels.create_channel(&conn).await.map(|wc| wc.upgrade()) {
                                             Ok(Some(channel)) => {
@@ -234,7 +240,7 @@ impl Comms {
                         match con {
                             Ok(con) => {
                                 // we have a new connection, we will wait until fully connected
-                                log::info!("Rabbit is connecting");
+                                log::info!("Connecting to RabbitMQ");
                                 connection = Some(con);
                             }
                             Err(err) => {
