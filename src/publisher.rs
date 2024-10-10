@@ -10,11 +10,11 @@ use futures::{
 };
 use std::collections::VecDeque;
 use std::sync::{Arc, Weak};
-use crate::comms::{ChannelSender, Comms, RabbitDispatcher};
+use crate::comms::{ChannelSender, Comms, CommsMsg, RabbitDispatcher};
 use lapin::options::{ConfirmSelectOptions, BasicPublishOptions};
 pub mod publisher_properties;
 #[cfg(feature = "tokio_runtime")]
-use tokio::sync::mpsc::{Receiver, UnboundedSender};
+use tokio::sync::mpsc::{Receiver, Sender as MpscSender};
 
 /// Callback to create confirm select options
 pub type GetCSO = Pin<Box<dyn Fn() -> ConfirmSelectOptions + Send + Sync>>;
@@ -24,7 +24,6 @@ pub type GetBPO = Pin<Box<dyn Fn() -> BasicPublishOptions + Send + Sync>>;
 pub type GetBP = Pin<Box<dyn Fn() -> BasicProperties + Send + Sync>>;
 
 
-// type Data<E> = (Weak<Channel>, E, Option<GetCSO>, Option<GetBPO>, Option<GetBP>);
 
 type SenderFuture<Address> = Pin<Box<dyn Future<Output = IdleData<Address>> + Send>>;
 
@@ -47,7 +46,7 @@ struct IdleData<Address> {
     /// Here will be a new channel delivered after requesting a new one
     channel_receiver: Option<Receiver<Weak<Channel>>>,
     /// The channel sender is requested over this
-    channel_requester: Arc<UnboundedSender<ChannelSender>>,
+    channel_requester: Arc<MpscSender<CommsMsg>>,
 }
 
 trait StartSending<Item, Address> {
@@ -192,9 +191,6 @@ where
     }
 }
 
-// impl<Item, RoutingKey, Exchange> ObjectCreator for Sender<Item, RoutingKey, Exchange> {
-//
-// }
 
 
 /// Sink wrapper for rabbit publisher.
@@ -375,51 +371,6 @@ impl<T,E,K> PublishWrapper<(T,K), E>
     }
 }
 
-// // NO LONGER IN USE
-// struct ConfirmChannel {
-//     confirm: GetCSO,
-//     channel_sender: ChannelSender,
-//     channel_receiver: Receiver<Weak<Channel>>,
-//     channel_requester: Arc<UnboundedSender<ChannelSender>>,
-// }
-//
-// impl ConfirmChannel {
-//     async fn confirm_channel<I, A>(
-//         mut self,
-//         address: A,
-//         publish_options: Option<GetBPO>,
-//         publish_properties: Option<GetBP>,
-//     ) -> PublishWrapper<I, A> {
-//         let (_, channel) = self.create_object(
-//             None,
-//             &self.channel_sender,
-//             &mut self.channel_receiver,
-//             &self.channel_requester,
-//         ).await;
-//         PublishWrapper::<I,A>{
-//             state: Some(
-//                 State::Idle(IdleData::<I, A> {
-//                     channel,
-//                     address,
-//                     confirm: Some(self.confirm),
-//                     publish_options,
-//                     publish_properties,
-//                     queue: VecDeque::new(),
-//                     channel_sender: self.channel_sender,
-//                     channel_receiver: self.channel_receiver,
-//                     channel_requester: self.channel_requester,
-//                 })
-//             )
-//         }
-//     }
-// }
-//
-// struct PublisherInitialiser {
-//     channel_sender: ChannelSender,
-//     confirm: Option<GetCSO>,
-//     channel_receiver: Receiver<Weak<Channel>>,
-//     channel_requester: Arc<UnboundedSender<ChannelSender>>,
-// }
 struct PublisherInitialiser;
 
 impl PublisherInitialiser {
@@ -431,7 +382,6 @@ impl PublisherInitialiser {
         log::trace!("Creating rabbit channel internals");
         let channel_requester = Comms::get_channel_comms();
         let (channel_sender, channel_receiver) = Comms::create_channel_channel();
-        let channel_sender = Arc::new(channel_sender);
         PublishWrapper::<I,A>{
             queue: VecDeque::new(),
             state: Some(
@@ -441,347 +391,11 @@ impl PublisherInitialiser {
                     confirm,
                     publish_options,
                     publish_properties,
-                    channel_sender: channel_sender,
+                    channel_sender,
                     channel_receiver: Some(channel_receiver),
-                    channel_requester: channel_requester,
+                    channel_requester,
                 })
             )
         }
     }
 }
-
-// impl ObjectCreator for ConfirmChannel {
-//     type Object = ();
-//
-//     async fn creator(&self, channel: &Channel) -> Result<Self::Object> {
-//         let _ = channel
-//             .confirm_select(confirm())
-//             .await?;
-//         Ok(())
-//     }
-// }
-//
-//
-// impl<Item, Exchange, RoutingKey> Sink<Item> for PublishWrapper<Item, (Exchange, RoutingKey)>
-//     where Item: Unpin + Send + Serialise + 'static,
-//           Exchange: AsRef<str> + Send + Unpin + 'static + Sync,
-//           RoutingKey: AsRef<str> + Send + Unpin + 'static + Sync,
-// {
-//     type Error = Error;
-//     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<()>> {
-//         let this = Pin::into_inner(self);
-//         loop {
-//             match this.state.take() {
-//                 Some(State::Sending { mut send, queue }) => {
-//                     let action = send.as_mut();
-//                     match Future::poll(action, cx) {
-//                         Poll::Pending => {
-//                             this.state = Some(State::Sending { send, queue });
-//                             return Poll::Pending;
-//                         }
-//                         Poll::Ready((channel, (exchange, routing_key), confirm, publish_options, publish_properties)) => {
-//                             // the data was send
-//                             this.state = Some(State::Idle { channel, address: (exchange, routing_key), queue, confirm, publish_options, publish_properties});
-//                         }
-//                     }
-//                 }
-//                 Some(State::Idle(mut data)) => {
-//                     // Some(State::Idle { channel, address: (exchange, routing_key), confirm, publish_options, publish_properties, mut queue }) => {
-//                     if let Some(item) = data.queue.pop_front() {
-//                         let return_func = move|channel, exchange, key, confirm, publish_options, publish_properties| (channel, (exchange, key), confirm, publish_options, publish_properties);
-//                         this.state = Some(State::Sending {
-//                             send: Box::pin(
-//                                 Self::send(
-//                                     item, channel, exchange, routing_key, confirm, publish_options, publish_properties, return_func)),
-//                             queue,
-//                         });
-//                     } else {
-//                         this.state = Some(State::Idle { channel, address: (exchange, routing_key), queue, confirm, publish_options, publish_properties});
-//                         return Poll::Ready(Ok(()));
-//                     }
-//                 }
-//                 None => unreachable!(),
-//             }
-//         }
-//     }
-//
-//     fn start_send(self: Pin<&mut Self>, item: Item) -> Result<()> {
-//         let this = Pin::into_inner(self);
-//         this.queue(item)?;
-//         Ok(())
-//     }
-//
-//     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<()>> {
-//         Self::poll_ready(self, cx)
-//     }
-//
-//     fn poll_close(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<()>> {
-//         Self::poll_ready(self, cx)
-//     }
-// }
-//
-// impl<T, E, K> Sink<(T, K)> for PublishWrapper<(T, K), E>
-//     where T: Unpin + Send + Serialise + 'static,
-//           E: AsRef<str> + Send + Unpin + 'static + Sync,
-//           K: AsRef<str> + Send + Unpin + 'static + Sync,
-// {
-//     type Error = Error;
-//     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<()>> {
-//         let this = Pin::into_inner(self);
-//         loop {
-//             match this.state.take() {
-//                 Some(State::Sending { mut send, queue }) => {
-//                     let action = send.as_mut();
-//                     match Future::poll(action, cx) {
-//                         Poll::Pending => {
-//                             this.state = Some(State::Sending { send, queue });
-//                             return Poll::Pending;
-//                         }
-//                         Poll::Ready((channel, exchange, confirm, publish_options, publish_properties)) => {
-//                             // the data was send
-//                             this.state = Some(State::Idle { channel, address: exchange, queue, confirm, publish_options, publish_properties});
-//                         }
-//                     }
-//                 }
-//                 Some(State::Idle { channel, address: exchange, confirm, publish_options, publish_properties, mut queue }) => {
-//                     if let Some((item, routing_key)) = queue.pop_front() {
-//                         this.state  = Some(State::Sending {
-//                             send: Box::pin(Self::send(item, channel, exchange, routing_key, confirm, publish_options, publish_properties, |channel, exchange, _, confirm, publish_options, publish_properties| (channel, exchange, confirm, publish_options, publish_properties))),
-//                             queue,
-//                         });
-//                     } else {
-//                         this.state = Some(State::Idle { channel, address: exchange, queue, confirm, publish_options, publish_properties});
-//                         return Poll::Ready(Ok(()));
-//                     }
-//                 }
-//                 None => unreachable!(),
-//             }
-//         }
-//     }
-//
-//     fn start_send(self: Pin<&mut Self>, item: (T, K)) -> Result<()> {
-//         let this = Pin::into_inner(self);
-//         this.queue(item)?;
-//         Ok(())
-//     }
-//
-//     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<()>> {
-//         Self::poll_ready(self, cx)
-//     }
-//
-//     fn poll_close(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<()>> {
-//         Self::poll_ready(self, cx)
-//     }
-// }
-
-// trait TSender<Item, Address>: ObjectCreator {
-//     type ItemData: Unpin + Send + Serialise;
-//     type RoutingKey;
-//     type Exchange;
-//     type Data;
-//     /// Check if there is an item to send and return appropriate state.
-//     /// If there is no item in the queue, the first bool marks we can return a ready poll state.
-//     fn start_sending(self, item: Item) -> SenderFuture<Address>;
-//
-//     fn pack_together(
-//         routing_key: Self::RoutingKey,
-//         exchange: Self::Exchange,
-//         data: Self::Data,
-//         channel: Weak<Channel>,
-//         channel_sender: ChannelSender,
-//         channel_receiver: Receiver<Weak<Channel>>,
-//         channel_requester: Arc<UnboundedSender<ChannelSender>>,
-//         ) -> Self;
-//
-//     fn send(
-//         item: Self::ItemData,
-//         routing_key: Self::RoutingKey,
-//         exchange: Self::Exchange,
-//         data: Self::Data,
-//         channel: Weak<Channel>,
-//         channel_sender: ChannelSender,
-//         channel_receiver: Receiver<Weak<Channel>>,
-//         channel_requester: Arc<UnboundedSender<ChannelSender>>,
-//     ) -> SenderFuture<Address> {
-//         Box::pin(async move {
-//             let data = Self::ItemData::serialise(&item);
-//             if data.as_ref().is_empty() {
-//                 log::trace!("No data after serialisation of the item. Skipping sending an empty message");
-//                 return Self::pack_together(routing_key, exchange, data, channel, channel_sender, channel_receiver, channel_requester);
-//             }
-//             loop {
-//                 // get the channel
-//                 let chan = if let Some(ch) = channel.upgrade() {
-//
-//                 } else {
-//
-//                 }
-//             }
-//         })
-//     }
-// }
-//
-// impl<Item, Address> PublishWrapper<Item, Address> {
-// async fn connect() -> Arc<Channel> {
-//     Comms::create_channel().await
-// }
-
-// fn queue(&mut self, item: Item) -> Result<()> {
-//     match &mut self.state {
-//         Some(State::Idle(IdleData { queue, .. })) => {
-//             queue.push_back(item);
-//         }
-//         Some(State::Sending { queue, .. }) => {
-//             queue.push_back(item);
-//         }
-//         None => anyhow::bail!("Invalid state"),
-//     }
-//     Ok(())
-// }
-
-// async fn set_channel(channel: &Weak<Channel>, confirm: Option<GetCSO>) -> std::result::Result< Option<GetCSO>, (anyhow::Error, Option<GetCSO>)> {
-//         if let Some(confirm) = confirm {
-//             if let Some(channel) = channel.upgrade() {
-//                 if let Err(err) = channel
-//                     .confirm_select(confirm())
-//                     .await {
-//                     Err((anyhow::Error::from(err), Some(confirm)))
-//                 } else {
-//                     Ok(Some(confirm))
-//                 }
-//             } else {
-//                 Err((anyhow::anyhow!("Invalid channel"), Some(confirm)))
-//             }
-//         } else {
-//             Ok(None)
-//         }
-// }
-
-// async fn send<T, A, E,K, D, R>(
-//         item: T,
-//         exchange: E,
-//         routing_key: K,
-//         mut data: IdleData<T, A>,
-//         return_func: R,
-//     ) -> Data<D>
-//         where T: Unpin + Send + Serialise,
-//               A: Send + Sync + 'static,
-//               E: AsRef<str> + Send + Unpin + 'static,
-//               K: AsRef<str> + Send + Unpin + 'static,
-//               R: FnOnce( E, K, IdleData<T, A>) -> Data<D>,
-//     {
-//         let data = T::serialise(&item);
-//         if data.as_ref().is_empty()  {
-//             log::trace!("Data is empty, skipping sending nothing");
-//             return return_func( exchange, routing_key, data);
-//         }
-//         loop {
-//             {
-//                 let (publish, id) = {
-//                     let channel = if let Some(ch) = channel.upgrade() {
-//                         ch
-//                     } else {
-//                         let ch = Self::connect().await;
-//                         channel = Arc::downgrade(&ch);
-//                         ch
-//                     };
-//                     if let Err(err) = Comms::create_exchange(channel.clone(), exchange.as_ref()).await {
-//                         log::error!("Error creating an exchange {:?}", err);
-//                         std::process::exit(1);
-//                     }
-//                     // let exchanges = Comms::get_exchanges().await;
-//                     // let exchanges = exchanges.read().await;
-//                     (channel.basic_publish(
-//                         exchange.as_ref(),
-//                         routing_key.as_ref(),
-//                         publish_options.as_ref().map(|o| o()).unwrap_or_else(|| BasicPublishOptions::default()),
-//                         data.as_ref(),
-//                         publish_properties.as_ref().map(|p| p()).unwrap_or_else(|| BasicProperties::default()),
-//                     ).await, channel.id())
-//                 };
-//                 match publish {
-//                     Ok(result) => {
-//                         use lapin::publisher_confirm::Confirmation;
-//                         match (result.await, confirm.is_some()) {
-//                             (Ok(Confirmation::Ack(None)), true) => {
-//                                 log::trace!(
-//                                     "Publish on channel {} confirmed",
-//                                     id,
-//                                 );
-//                                 return return_func(channel, exchange, routing_key, confirm, publish_options, publish_properties);
-//                             }
-//                             (Ok(_), true) => {
-//                                 log::error!("Failed to confirm message publish on channel {}, repeating the send", id);
-//                                 continue;
-//                             }
-//                             (Err(err), _) => {
-//                                 log::error!("Failed to publish message on channel {}, repeating the send: {}", id, err);
-//                             }
-//                             (_, false) => {
-//                                 log::trace!("Published");
-//                                 return return_func(channel, exchange, routing_key, confirm, publish_options, publish_properties);
-//                             }
-//                         }
-//                     }
-//                     Err(err) => {
-//                         log::error!(
-//                             "Failed to send message to {} of key {}: {}",
-//                             exchange.as_ref(),
-//                             routing_key.as_ref(),
-//                             err
-//                         );
-//                     }
-//                 }
-//             }
-//             loop {
-//                 // here we can unwrap, because the connect should never fail if it succeeded once
-//                 match Self::set_channel(Self::connect().await, confirm).await {
-//                     Ok((value, con)) => {
-//                         channel = Arc::downgrade(&value);
-//                         confirm = con;
-//                         break;
-//                     }
-//                     Err((err, con)) => {
-//                         log::error!("Failing to set confirm select on the channel: {}", err);
-//                         confirm = con;
-//                     }
-//                 };
-//             }
-//         }
-//     }
-// }
-
-// impl<Item, Address> Sender<Item, Address> for IdleData<Address> {
-//     // fn start_sending(self, item: Item) -> SenderFuture<Address> {
-//     //     todo!()
-//     // }
-// }
-
-// struct SendItem<T, E, K> {
-//     item: T,
-//     exchange: E,
-//     routing_key: K,
-//     data: IdleData<T>,
-// }
-
-
-
-// #[async_trait::async_trait]
-// impl<Item> ObjectCreator for IdleData<Item>
-// impl<T, E, K> ObjectCreator for SendItem<T, E, K> {}
-// where
-//     Item: Sync + Send +'static,
-//     Address: Sync + Send +'static,
-// {
-//     type Object = ();
-//
-//     async fn creator(&self, channel: &Channel) -> Result<Self::Object> {
-//             (channel.basic_publish(
-//                 exchange.as_ref(),
-//                 routing_key.as_ref(),
-//                 publish_options.as_ref().map(|o| o()).unwrap_or_else(|| BasicPublishOptions::default()),
-//                 data.as_ref(),
-//                 publish_properties.as_ref().map(|p| p()).unwrap_or_else(|| BasicProperties::default()),
-//             ).await, channel.id())
-//     }
-// }

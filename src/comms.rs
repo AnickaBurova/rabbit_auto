@@ -6,7 +6,7 @@ use lapin::{Connection, Channel, ConnectionProperties, ConnectionState};
 use std::sync::{Arc, Weak};
 use futures::lock::Mutex;
 use std::pin::Pin;
-use futures::Future;
+use futures::{Future};
 use lapin::types::{AMQPValue, ShortUInt};
 // use crate::comms::comms_data::Data;
 use crate::config::Config;
@@ -15,7 +15,7 @@ use crate::exchanges::DeclareExchange;
 
 pub const MAX_CHANNELS: usize = 16;
 #[cfg(feature = "tokio_runtime")]
-use tokio::sync::{mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender, unbounded_channel, channel}};
+use tokio::sync::{mpsc::{Receiver, Sender,  channel}};
 
 
 #[cfg(feature = "async_std_runtime")]
@@ -35,70 +35,52 @@ pub type ChannelSender = Arc<Sender<Weak<Channel>>>;
 
 /// RabbitMQ connection singleton
 pub struct Comms;
-// {
-//     /// Login and config data
-//     config: Option<Config>,
-//     /// Counter
-//     connection_attempt: usize,
-//     // exchanges: Arc<RwLock<HashMap<String, DeclareExchange>>>,
-//     exchanges: HashMap<String, Arc<DeclareExchange>>,
-//     /// The connection
-//     connection: Option<Data>,
-//     // should_sleep: bool,
-// }
+/// Internal size of the channel buffer
+const COMMS_MSG_SIZE: usize = 32;
+
+pub(crate) enum CommsMsg {
+    DeclareExchange {
+        exchange: String,
+        declare: DeclareExchange,
+    },
+    RequestChannel(ChannelSender),
+}
 
 
 impl Comms {
     /// Declare exchange
     pub async fn declare_exchange(exchange: String, declare: DeclareExchange) {
-        let sender = Self::channel_comms().1;
-        if let Err(err) = sender.send((exchange, declare)) {
+        let sender = Self::channel_comms().0;
+        log::debug!("Sending {exchange} declaration to the rabbit loop");
+        if let Err(err) = sender.send(CommsMsg::DeclareExchange { exchange, declare }).await {
             log::error!("Declare exchange internal comms is broken: {err}");
             std::process::exit(-1);
         }
-        // let this = Self::get();
-        // let mut this = this.lock().await;
-        // if this.exchanges.contains_key(&exchange) {
-        //     anyhow::bail!("Exchange {} already declared", exchange);
-        // }
-        // // let mut exchanges = this.exchanges.write().await;
-        // this.exchanges.insert(exchange, Arc::new(declare));
-        // Ok(())
     }
 
     /// Gets the singleton global data
-    fn channel_comms() -> (
-        &'static Arc<UnboundedSender<ChannelSender>>,
-        &'static Arc<UnboundedSender<(String, DeclareExchange)>>,
-        &'static Arc<Mutex<Option<(
-            UnboundedReceiver<ChannelSender>,
-            UnboundedReceiver<(String, DeclareExchange)>,
-        )>>>
-    ){
+    /// The Receiver is taken away by the configure method when is started.
+    fn channel_comms() -> (&'static Arc<Sender<CommsMsg>>, &'static Arc<Mutex<Option<Receiver<CommsMsg>>>>)
+    {
         lazy_static::lazy_static! {
-            static ref CHANNEL_COMMS:
-                (Arc<UnboundedSender<ChannelSender>>,
-                    Arc<UnboundedSender<(String, DeclareExchange)>>,
-                    Arc<Mutex<Option<(UnboundedReceiver<ChannelSender>, UnboundedReceiver<(String, DeclareExchange)>)>>>) = {
-                    let (tx, rx) = unbounded_channel();
-                let (dtx, drx) = unbounded_channel();
-                    (Arc::new(tx),
-                        Arc::new(dtx),
-                        Arc::new(Mutex::new(Some((rx, drx)))))
-                };
+            static ref COMMS: (Arc<Sender<CommsMsg>>, Arc<Mutex<Option<Receiver<CommsMsg>>>>) = {
+                let (tx, rx) = channel(COMMS_MSG_SIZE);
+                (Arc::new(tx), Arc::new(Mutex::new(Some(rx))))
+            };
         }
-        (&CHANNEL_COMMS.0, &CHANNEL_COMMS.1, &CHANNEL_COMMS.2)
+        (&COMMS.0, &COMMS.1)
     }
 
 
     /// Gets the singleton channel sender. This is already cloned and ready to use
-    pub(crate) fn get_channel_comms() -> Arc<UnboundedSender<ChannelSender>> {
+    pub(crate) fn get_channel_comms() -> Arc<Sender<CommsMsg>> {
         Self::channel_comms().0.clone()
     }
 
     /// Creates a new channel to transfer Weak<Channel> object
-    pub(crate) fn create_channel_channel() -> (Sender<Weak<Channel>>, Receiver<Weak<Channel>>) {
-        channel(2)
+    pub(crate) fn create_channel_channel() -> (Arc<Sender<Weak<Channel>>>, Receiver<Weak<Channel>>) {
+        let (tx, rx) = channel(2);
+        (Arc::new(tx), rx)
     }
 
 
@@ -111,9 +93,10 @@ impl Comms {
     {
         let executor = config.executor.clone();
         executor.spawn(Box::pin(async move {
-            let (mut channel_requester, mut declare_exchange_requester)  = {
-                log::trace!("Taking the channel requester from the global area");
-                let singleton = Self::channel_comms().2.clone();
+            // let (mut channel_requester, mut declare_exchange_requester)  = {
+            let mut msg_receiver = {
+                log::debug!("Taking the channel requester from the global area");
+                let singleton = Self::channel_comms().1.clone();
                 let mut channel_receiver = singleton.lock().await;
                 if let Some(cr) = channel_receiver.take() {
                     cr
@@ -122,7 +105,7 @@ impl Comms {
                     std::process::exit(1);
                 }
             };
-            log::trace!("Channel requester taken, we can start the rabbit loop");
+            log::debug!("Channel requester taken, we can start the rabbit loop");
             let mut connection: Option<Connection> = None;
             let mut connection_attempt = 0;
             let mut declare_exchanges = HashMap::new();
@@ -130,27 +113,35 @@ impl Comms {
             let mut channels = channels_ring::Channels::new();
             let mut is_connecting = false;
             loop {
-                let mut channel_sender = None;
-                tokio::select!(
-                    Some((exchange, declare)) = declare_exchange_requester.recv() => {
-                        log::trace!("Received a new exchange declaration for {exchange}");
-                        declare_exchanges.insert(exchange, declare);
+                let mut channel_sender = Vec::with_capacity(COMMS_MSG_SIZE);
+                let mut msgs = Vec::with_capacity(COMMS_MSG_SIZE);
+                let _ = msg_receiver.recv_many(&mut msgs, COMMS_MSG_SIZE).await;
+                for msg in msgs.into_iter() {
+                    match msg {
+                        CommsMsg::DeclareExchange { exchange, declare } => {
+                            log::trace!("Received a new exchange declaration for {exchange}");
+                            declare_exchanges.insert(exchange, declare);
+                        }
+                        CommsMsg::RequestChannel(cs) => {
+                            log::trace!("There is a request for a channel");
+                            channel_sender.push(cs);
+                        }
                     }
-                    Some(cs) = channel_requester.recv() => {
-                        log::trace!("There is a request for a channel");
-                        channel_sender = Some(cs);
-                    }
-                );
+                }
+                if channel_sender.is_empty() {
+                    log::debug!("No channel requesters yet, going back waiting");
+                    continue;
+                }
                 // try to establish a connection until we have one and can send a channel back to the requester
                 loop {
                     // connect
                     if let Some(conn) = connection.take() {
                         // validate the connection
-                        log::trace!("Connection exist, validating it");
+                        log::debug!("Validating an existing connection");
                         'connection: loop {
                             match conn.status().state() {
                                 ConnectionState::Initial | ConnectionState::Connecting => {
-                                    log::trace!("Connecting is in progress");
+                                    log::debug!("Connecting is in progress");
                                     // lets check again in a while
                                     config.reactor.sleep(std::time::Duration::from_millis(100)).await;
                                 }
@@ -160,23 +151,29 @@ impl Comms {
                                         log::info!("Connection to RabbitMQ established");
                                         is_connecting = false;
                                     } else {
-                                        log::trace!("RabbitMQ is connected");
+                                        log::debug!("RabbitMQ is already connected");
                                     }
                                     if !declare_exchanges.is_empty() {
-                                        match channels.create_channel(&conn).await.map(|wc| wc.upgrade()) {
-                                            Ok(Some(channel)) => {
+                                        log::debug!("There are {} exchanges to declare", declare_exchanges.len());
+                                        match channels.create_channel(&conn).await {
+                                            Ok(channel) => {
                                                 // run all exchange declarations
-                                                for (exchange, declare) in declare_exchanges.iter() {
-                                                    log::trace!("Running exchange declaration for '{exchange}'");
-                                                    if let Err(err) = declare(channel.clone()).await {
-                                                        log::error!("Failed to declare an exchange: {err}");
-                                                        continue 'connection;
+                                                while !declare_exchanges.is_empty() {
+                                                    let mut done = None;
+                                                    for (exchange, declare) in declare_exchanges.iter() {
+                                                        log::debug!("Running exchange declaration for '{exchange}'");
+                                                        if let Err(err) = declare(channel.clone()).await {
+                                                            log::error!("Failed to declare an exchange: {err}");
+                                                            continue 'connection;
+                                                        }
+                                                        log::debug!("Exchange '{exchange}' declared");
+                                                        done = Some(exchange.clone());
+                                                        break;
+                                                    }
+                                                    if let Some(exchange) = done {
+                                                        declare_exchanges.remove(&exchange);
                                                     }
                                                 }
-                                            }
-                                            Ok(None) => {
-                                                log::error!("Channel is already gone, this should be unreachable");
-                                                std::process::exit(1);
                                             }
                                             Err(err) => {
                                                 // creating the channel failed, we need a new connection
@@ -185,6 +182,7 @@ impl Comms {
                                         }
                                     }
                                     connection = Some(conn);
+                                    log::debug!("Connection initialised");
                                     break;
                                 }
                                 ConnectionState::Closing |
@@ -198,17 +196,18 @@ impl Comms {
                             }
                         }
                     } else {
-                        log::trace!("There is no connection yet");
+                        log::debug!("There is no connection yet");
                     }
                     // check if the connection exists or we need a new one
                     if let Some(conn) = connection.take() {
                         // so the connection should be valid, we can finally get the channel and send it
-                        log::trace!("Connection exist, getting the channel");
-                        match channels.create_channel(&conn).await {
-                            Ok(channel) => {
-                                log::trace!("Channel created, sending it to the requester");
-                                if let Some(channel_sender) = channel_sender.as_ref() {
-                                    if let Err(err) = channel_sender.send(channel).await {
+                        log::debug!("Connection exist, getting channels");
+                        match channels.create_channels(channel_sender.len(), &conn).await {
+                            Ok(channels) => {
+                                log::debug!("Channels are created, sending them to the individual requesters");
+                                for (cs, channel) in channel_sender.drain(..).zip(channels) {
+                                    let channel = Arc::downgrade(&channel);
+                                    if let Err(err) = cs.send(channel).await {
                                         log::error!("Fatal error. Failed to send the channel back to the requester: {err}");
                                         std::process::exit(1);
                                     }
@@ -223,10 +222,10 @@ impl Comms {
                         }
                     } else {
                         // we need a new one
-                        log::trace!("Closing any existing channels if any");
+                        log::debug!("Closing any existing channels if any");
                         channels.try_close().await; // close any existing channels
 
-                        log::trace!("No connection, attempting to connect [{connection_attempt}]",);
+                        log::debug!("No connection, attempting to connect [{connection_attempt}]",);
                         let mut properties = ConnectionProperties::default()
                             .with_connection_name(config.name.clone().into());
                         properties.executor = Some(config.executor.clone());
@@ -245,7 +244,7 @@ impl Comms {
                             }
                             Err(err) => {
                                 log::error!("Failed to connect: {err}");
-                                log::trace!("Sleeping for {} seconds", config.reconnect_delay.as_secs_f64());
+                                log::debug!("Sleeping for {} seconds", config.reconnect_delay.as_secs_f64());
                                 config.reactor.sleep(config.reconnect_delay).await;
                             }
                         }
@@ -255,23 +254,6 @@ impl Comms {
         }));
     }
 
-    // /// Gets the Comms's Singleton
-    // pub fn get() -> Arc<Mutex<Self>> {
-    //     lazy_static::lazy_static! {
-    //         static ref SINGLETON: Arc<Mutex<Comms>> = Comms::new();
-    //     }
-    //
-    //     SINGLETON.clone()
-    // }
-
-    // pub(crate) async fn create_exchange(channel: Arc<Channel>, exchange: &str) -> anyhow::Result<()> {
-    //     let this = Self::get();
-    //     let this = this.lock().await;
-    //     if let Some(declare) = this.exchanges.get(exchange) {
-    //         declare(channel).await?;
-    //     }
-    //     Ok(())
-    // }
 }
 
 /// This will dispatch an operation on a channel. If the channel is not
@@ -289,7 +271,7 @@ pub(crate) trait RabbitDispatcher: Sync + Send {
         mut channel: Option<Weak<Channel>>,
         channel_sender: &ChannelSender,
         channel_receiver: &mut Receiver<Weak<Channel>>,
-        channel_requester: &Arc<UnboundedSender<ChannelSender>>,
+        channel_requester: &Arc<Sender<CommsMsg>>,
     ) -> (Self::Object, Weak<Channel>) {
         let mut setup_channel = false;
         loop {
@@ -298,7 +280,7 @@ pub(crate) trait RabbitDispatcher: Sync + Send {
                 channel
             } else {
                 // if the channel is None, we need to request a new channel from the Comms
-                if let Err(err) = channel_requester.send(channel_sender.clone()) {
+                if let Err(err) = channel_requester.send(CommsMsg::RequestChannel(channel_sender.clone())).await {
                     log::error!("Fatal internal error. Failed to request a new channel: {err}");
                     std::process::exit(1);
                 }

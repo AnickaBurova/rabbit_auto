@@ -1,4 +1,4 @@
-use std::sync::{Arc, Weak};
+use std::sync::{Arc};
 use lapin::{Channel, Connection};
 
 
@@ -15,18 +15,25 @@ impl Channels {
         }
     }
 
-    pub(crate) async fn create_channel(&mut self, connection: &Connection) -> anyhow::Result<Weak<Channel>> {
+    pub async fn create_channels(&mut self, count: usize, connection: &Connection) -> anyhow::Result<Vec<Arc<Channel>>> {
+        let mut result = Vec::with_capacity(count);
+        for _ in 0..count {
+            result.push(self.create_channel(connection).await?);
+        }
+        Ok(result)
+    }
+
+    pub(crate) async fn create_channel(&mut self, connection: &Connection) -> anyhow::Result<Arc<Channel>> {
         let index = self.current;
         self.current = (self.current + 1) % super::MAX_CHANNELS;
         if self.channels.len() < index + 1 {
-            log::trace!("Creating a new channel: {index}");
+            log::debug!("Creating a new channel: {index}");
             let channel = Arc::new(connection.create_channel().await?);
-            let result = Arc::downgrade(&channel);
-            self.channels.push(channel);
-            Ok(result)
+            self.channels.push(channel.clone());
+            Ok(channel)
         } else {
-            log::trace!("Returning ring channel {index}");
-            Ok(Arc::downgrade(&self.channels[index]))
+            log::debug!("Returning ring channel {index}");
+            Ok(self.channels[index].clone())
         }
     }
 

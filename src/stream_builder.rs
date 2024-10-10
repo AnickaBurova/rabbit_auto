@@ -84,11 +84,6 @@ impl<Q, T, K, E> RabbitDispatcher for StreamBuilderWithName<Q, T, K, E>
                     self.binding_fields.clone().unwrap_or_else(|| lapin::types::FieldTable::default()),
                 )
                 .await?;
-            // log::trace!(
-            //     "Creating rabbit '{}' consumer at {}",
-            //     stringify!($item),
-            //     channel.id()
-            // );
             channel
                 .basic_consume(
                     queue_name,
@@ -118,80 +113,6 @@ impl<Q, T,K,E> StreamBuilderWithName<Q, T, K, E>
     /// Creates a consumer which returns channel and the delivery.
     pub async fn create_plain(self) -> impl StreamExt<Item = Delivery> + Unpin + Send {
         ConsumerWrapper::new(Box::new(self)).await
-       //  let
-       //  let consumer = ConsumerWrapper::new(self.exchange.clone(), Box::pin(move |channel: Arc<Channel>, exchange: Option<Arc<DeclareExchange>>| {
-       //      // log::trace!("Declaring rabbit '{}' queue", stringify!($item));
-       //      // TODO: do we need to clone this?
-       //      let this = self.clone();
-       //      Box::pin(async move {
-       //          let consumer = {
-       //              log::trace!("Declare exchange if needed");
-       //              if let Some(declare_exchange) = exchange {
-       //                  log::trace!("Declaring exchange: {}", this.exchange.as_ref());
-       //                  (*declare_exchange)(channel.clone()).await?;
-       //              }
-       //              if let Some((qos, options)) = this.qos {
-       //                  channel.basic_qos(qos,
-       //                                    options.unwrap_or_else(|| lapin::options::BasicQosOptions::default())
-       //                  ).await?;
-       //              }
-       //              let queue_name = if let Some(queue_name) = this.queue_name.as_ref() {
-       //                  queue_name.as_ref()
-       //              } else {
-       //                  this.routing_key.as_ref()
-       //              };
-       //              if let Err(err) = channel.queue_declare(queue_name,
-       //                                    this.declare
-       //                                        .unwrap_or_else(|| lapin::options::QueueDeclareOptions::default()),
-       //                                    this.declare_fields.unwrap_or_else(|| lapin::types::FieldTable::default()),
-       //              ).await {
-       //                  let channel = Comms::create_channel().await;
-       //                  log::warn!("Deleting incompatible queue: {}", err);
-       //                  if this.incompatible_delete {
-       //                      let msgs = channel.queue_delete(queue_name, QueueDeleteOptions {
-       //                          if_unused: false,
-       //                          if_empty: false,
-       //                          nowait: true,
-       //                      }).await?;
-       //                      log::warn!("Incompatible queue deleted");
-       //                      if msgs > 0 {
-       //                          log::warn!("Deleting the previous queue purged {} messages", msgs);
-       //                      }
-       //                      Err(err)?;
-       //                  } else {
-       //                      Err(err)?;
-       //                  }
-       //              }
-       //              log::trace!("Queue declared, binding it");
-       //
-       //              channel
-       //                  .queue_bind(
-       //                      queue_name,
-       //                      this.exchange.as_ref(),
-       //                      this.routing_key.as_ref(),
-       //                      this.binding.unwrap_or_else(|| lapin::options::QueueBindOptions::default()),
-       //                      this.binding_fields.unwrap_or_else(|| lapin::types::FieldTable::default()),
-       //                  )
-       //                  .await?;
-       //              // log::trace!(
-       //              //     "Creating rabbit '{}' consumer at {}",
-       //              //     stringify!($item),
-       //              //     channel.id()
-       //              // );
-       //              channel
-       //                  .basic_consume(
-       //                      queue_name,
-       //                      this.tag.as_ref(),
-       //                      this.consume.unwrap_or_else(|| lapin::options::BasicConsumeOptions::default()),
-       //                      this.consume_fields.unwrap_or_else(|| lapin::types::FieldTable::default()),
-       //                  )
-       //                  .await?
-       //          };
-       //          Ok((channel, consumer))
-       //      })
-       //  }))
-       //      .await;
-       // consumer
     }
 
     /// Creates a consumer which returns an acker and the deserialised item

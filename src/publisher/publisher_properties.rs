@@ -4,22 +4,6 @@ use std::time::{Duration, SystemTime};
 use lapin::protocol::basic::AMQPProperties;
 use crate::publisher::GetBP;
 
-// pub struct AMQPProperties {
-//     content_type: Option<ShortString>,
-//     content_encoding: Option<ShortString>,
-//     headers: Option<FieldTable>,
-//     delivery_mode: Option<ShortShortUInt>,
-//     priority: Option<ShortShortUInt>,
-//     correlation_id: Option<ShortString>,
-//     reply_to: Option<ShortString>,
-//     expiration: Option<ShortString>,
-//     message_id: Option<ShortString>,
-//     timestamp: Option<Timestamp>,
-//     kind: Option<ShortString>,
-//     user_id: Option<ShortString>,
-//     app_id: Option<ShortString>,
-//     cluster_id: Option<ShortString>,
-// }
 
 /// Wrapper for AMQPProperties
 /// https://www.rabbitmq.com/publishers.html#message-properties

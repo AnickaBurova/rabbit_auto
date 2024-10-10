@@ -1,7 +1,7 @@
 //! A stream wrapper for rabbitmq consumer. This stream never fails and will consume until stopped being used.
 use core::pin::Pin;
 #[cfg(feature = "tokio_runtime")]
-use tokio::sync::mpsc::{Receiver, UnboundedSender};
+use tokio::sync::mpsc::{Receiver, Sender};
 // #[cfg(feature = "async_std_runtime")]
 // use async_std::sync::RwLock;
 use std::sync::{Arc, Weak};
@@ -18,7 +18,6 @@ use super::comms::*;
 
 /// Returns a future which creates the consumer from the provided channel.
 type ConsumerCreator = Box<dyn RabbitDispatcher<Object = Consumer>>;
-// Creator<(Arc<Channel>, Consumer)>;
 
 pub type CreatorResult<T> = Pin<Box<dyn Future<Output = Result<T>> + Send>>;
 pub type Creator<T> = Pin<Box<dyn Fn(Arc<Channel>, Option<Arc<DeclareExchange>>) -> CreatorResult<T> + Send + Sync>>;
@@ -49,7 +48,7 @@ struct Data {
     /// Here will be a new channel delivered after requesting a new one
     channel_receiver: Receiver<Weak<Channel>>,
     /// The channel sender is requested over this
-    channel_requester: Arc<UnboundedSender<ChannelSender>>,
+    channel_requester: Arc<Sender<CommsMsg>>,
 }
 
 enum State {
@@ -83,7 +82,6 @@ impl ConsumerWrapper {
         log::trace!("Getting channel requester");
         let channel_requester = Comms::get_channel_comms();
         let (channel_sender, mut channel_receiver) = Comms::create_channel_channel();
-        let channel_sender = Arc::new(channel_sender);
         log::trace!("Creating the consumer using the creator");
         let (consumer, channel) =
             creator.start_dispatch(
@@ -91,30 +89,12 @@ impl ConsumerWrapper {
                 &channel_sender,
                 &mut channel_receiver,
                 &channel_requester).await;
-        // let (creator, (channel, consumer)) = Self::connect(exchange.as_ref(), creator).await;
         log::trace!("Consumer wrapper created");
         Self {
             state: Some(State::Idle(Data { consumer, channel, creator, channel_sender, channel_receiver, channel_requester})),
         }
-        // Self { state: Some(State::Idle { exchange, consumer, channel: Arc::downgrade(&channel), creator })}
     }
 
-    // /// Connects to the rabbit by passing the creator function
-    // // async fn connect(
-    // //     creator: ConsumerCreator,
-    // // ) -> Result<(ConsumerCreator, (Channel, Consumer))> {
-    // //     Comms::create_channel_and_object::<(Channel, Consumer)>(creator).await
-    // // }
-    //
-    // async fn connect(
-    //     exchange: &str,
-    //     creator: ConsumerCreator,
-    // ) -> (
-    //     Creator<(Arc<Channel>, Consumer)>,
-    //     (Arc<Channel>, Consumer),
-    // ) {
-    //     Comms::create_object::<(Arc<Channel>, Consumer)>(exchange, creator).await
-    // }
 
     /// Gets the next item from the consumer. If the consumer is broken, then a new consumer is automatically created
     async fn next_item(mut data: Data)
