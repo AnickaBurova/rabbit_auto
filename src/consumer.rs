@@ -1,18 +1,15 @@
 //! A stream wrapper for rabbitmq consumer. This stream never fails and will consume until stopped being used.
+use crate::exchanges::DeclareExchange;
+use anyhow::Result;
 use core::pin::Pin;
-#[cfg(feature = "tokio_runtime")]
-use tokio::sync::mpsc::{Receiver, Sender};
-// #[cfg(feature = "async_std_runtime")]
-// use async_std::sync::RwLock;
-use std::sync::{Arc, Weak};
 use futures::{
     future::Future,
     stream::Stream,
     task::{Context, Poll},
 };
 use lapin::{message::Delivery, Channel, Consumer};
-use anyhow::Result;
-use crate::exchanges::DeclareExchange;
+use std::sync::{Arc, Weak};
+use tokio::sync::mpsc::{Receiver, Sender};
 
 use super::comms::*;
 
@@ -20,20 +17,12 @@ use super::comms::*;
 type ConsumerCreator = Box<dyn RabbitDispatcher<Object = Consumer>>;
 
 pub type CreatorResult<T> = Pin<Box<dyn Future<Output = Result<T>> + Send>>;
-pub type Creator<T> = Pin<Box<dyn Fn(Arc<Channel>, Option<Arc<DeclareExchange>>) -> CreatorResult<T> + Send + Sync>>;
+pub type Creator<T> =
+    Pin<Box<dyn Fn(Arc<Channel>, Option<Arc<DeclareExchange>>) -> CreatorResult<T> + Send + Sync>>;
 
 pub type ChannelReceiver = Receiver<Weak<Channel>>;
 
-type NextFuture = Pin<
-    Box<
-        dyn Future<
-            Output = (
-                Delivery,
-                Data,
-            ),
-        > + Send,
-    >,
->;
+type NextFuture = Pin<Box<dyn Future<Output = (Delivery, Data)> + Send>>;
 
 struct Data {
     /// RabbitMQ consumer
@@ -58,7 +47,7 @@ enum State {
     Next {
         /// Future to get the next item
         next: NextFuture,
-    }
+    },
 }
 
 /// Consumer wrapper handles errors in the connection. If the rabbitmq is disconnected, instead of
@@ -70,7 +59,6 @@ pub struct ConsumerWrapper {
 }
 
 impl ConsumerWrapper {
-
     /// Create a new consumer by providing a creator function. This function might be called many times,
     /// as often as we loose connection to the rabbitmq.
     // pub async fn new(creator: ConsumerCreator) -> Result<Self> {
@@ -83,22 +71,29 @@ impl ConsumerWrapper {
         let channel_requester = Comms::get_channel_comms();
         let (channel_sender, mut channel_receiver) = Comms::create_channel_channel();
         log::trace!("Creating the consumer using the creator");
-        let (consumer, channel) =
-            creator.start_dispatch(
+        let (consumer, channel) = creator
+            .start_dispatch(
                 None,
                 &channel_sender,
                 &mut channel_receiver,
-                &channel_requester).await;
+                &channel_requester,
+            )
+            .await;
         log::trace!("Consumer wrapper created");
         Self {
-            state: Some(State::Idle(Data { consumer, channel, creator, channel_sender, channel_receiver, channel_requester})),
+            state: Some(State::Idle(Data {
+                consumer,
+                channel,
+                creator,
+                channel_sender,
+                channel_receiver,
+                channel_requester,
+            })),
         }
     }
 
-
     /// Gets the next item from the consumer. If the consumer is broken, then a new consumer is automatically created
-    async fn next_item(mut data: Data)
-        -> (Delivery, Data) {
+    async fn next_item(mut data: Data) -> (Delivery, Data) {
         loop {
             use futures::stream::StreamExt;
             log::trace!("Polling consumer");
@@ -115,10 +110,15 @@ impl ConsumerWrapper {
                 }
             }
             log::warn!("Consumer is broken, waiting for a new connection");
-            let (consumer, channel) = data.creator.start_dispatch(Some(data.channel.clone()),
-                                                                  &data.channel_sender,
-                                                                  &mut data.channel_receiver,
-                                                                  &data.channel_requester).await;
+            let (consumer, channel) = data
+                .creator
+                .start_dispatch(
+                    Some(data.channel.clone()),
+                    &data.channel_sender,
+                    &mut data.channel_receiver,
+                    &data.channel_requester,
+                )
+                .await;
             data.consumer = consumer;
             data.channel = channel;
         }
@@ -151,7 +151,7 @@ impl Stream for ConsumerWrapper {
                             log::trace!("Ready");
                             Poll::Ready(Some(delivery))
                         }
-                    }
+                    };
                 }
                 None => unreachable!(),
             }

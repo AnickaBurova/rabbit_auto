@@ -26,9 +26,7 @@ Comms::configure(Config::new(
     "rabbit password",
     // reconnection interval when the connection is lost
     Duration::from_secs(3),
-    tokio_executor_trait::Tokio::current(),
-    tokio_reactor_trait::Tokio,
-);
+).expect("Failed to configure rabbit-auto"));
 
 // Publisher Sink which expects the MsgOut and routing key String
 // the created publisher of type impl Sink<(MsgOut, String)> + Unpin,

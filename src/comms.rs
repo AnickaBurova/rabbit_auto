@@ -1,35 +1,28 @@
 //! Helper to create a connection and keep it connected.
 
-
-use std::collections::HashMap;
-use lapin::{Connection, Channel, ConnectionProperties, ConnectionState};
-use std::sync::{Arc, Weak};
+use async_rs::traits::{Executor, Reactor};
+use async_rs::Runtime;
 use futures::lock::Mutex;
-use std::pin::Pin;
-use futures::{Future};
+use futures::Future;
 use lapin::types::{AMQPValue, ShortUInt};
+use lapin::{Channel, Connection, ConnectionProperties, ConnectionState};
+use std::collections::HashMap;
+use std::pin::Pin;
+use std::sync::{Arc, Weak};
 // use crate::comms::comms_data::Data;
 use crate::config::Config;
 use crate::exchanges::DeclareExchange;
 
-
 pub const MAX_CHANNELS: usize = 16;
-#[cfg(feature = "tokio_runtime")]
-use tokio::sync::{mpsc::{Receiver, Sender,  channel}};
-
-
-#[cfg(feature = "async_std_runtime")]
-use async_std::sync::RwLock;
-use executor_trait::FullExecutor;
-use reactor_trait::Reactor;
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 /// Result of the creator function
 pub type CreatorResult<T> = Pin<Box<dyn Future<Output = anyhow::Result<T>> + Send>>;
 /// Creator function
-pub type Creator<T> = Pin<Box<dyn Fn(Arc<Channel>, Option<Arc<DeclareExchange>>) -> CreatorResult<T> + Send + Sync>>;
+pub type Creator<T> =
+    Pin<Box<dyn Fn(Arc<Channel>, Option<Arc<DeclareExchange>>) -> CreatorResult<T> + Send + Sync>>;
 
 pub type ChannelSender = Arc<Sender<Weak<Channel>>>;
-
 
 // mod comms_data;
 
@@ -46,13 +39,15 @@ pub(crate) enum CommsMsg {
     RequestChannel(ChannelSender),
 }
 
-
 impl Comms {
     /// Declare exchange
     pub async fn declare_exchange(exchange: String, declare: DeclareExchange) {
         let sender = Self::channel_comms().0;
         log::debug!("Sending {exchange} declaration to the rabbit loop");
-        if let Err(err) = sender.send(CommsMsg::DeclareExchange { exchange, declare }).await {
+        if let Err(err) = sender
+            .send(CommsMsg::DeclareExchange { exchange, declare })
+            .await
+        {
             log::error!("Declare exchange internal comms is broken: {err}");
             std::process::exit(-1);
         }
@@ -60,8 +55,10 @@ impl Comms {
 
     /// Gets the singleton global data
     /// The Receiver is taken away by the configure method when is started.
-    fn channel_comms() -> (&'static Arc<Sender<CommsMsg>>, &'static Arc<Mutex<Option<Receiver<CommsMsg>>>>)
-    {
+    fn channel_comms() -> (
+        &'static Arc<Sender<CommsMsg>>,
+        &'static Arc<Mutex<Option<Receiver<CommsMsg>>>>,
+    ) {
         lazy_static::lazy_static! {
             static ref COMMS: (Arc<Sender<CommsMsg>>, Arc<Mutex<Option<Receiver<CommsMsg>>>>) = {
                 let (tx, rx) = channel(COMMS_MSG_SIZE);
@@ -71,28 +68,24 @@ impl Comms {
         (&COMMS.0, &COMMS.1)
     }
 
-
     /// Gets the singleton channel sender. This is already cloned and ready to use
     pub(crate) fn get_channel_comms() -> Arc<Sender<CommsMsg>> {
         Self::channel_comms().0.clone()
     }
 
     /// Creates a new channel to transfer Weak<Channel> object
-    pub(crate) fn create_channel_channel() -> (Arc<Sender<Weak<Channel>>>, Receiver<Weak<Channel>>) {
+    pub(crate) fn create_channel_channel() -> (Arc<Sender<Weak<Channel>>>, Receiver<Weak<Channel>>)
+    {
         let (tx, rx) = channel(2);
         (Arc::new(tx), rx)
     }
 
-
     /// The connection needs to be configured before the first using
     /// This is no longer async method and this will start the rabbit auto connection manager.
-    pub fn configure<E, R>(config: Config<E, R>)
-        where
-            E: FullExecutor + Sync + Send + 'static,
-            R: Reactor + Sync + Send + 'static,
-    {
-        let executor = config.executor.clone();
-        executor.spawn(Box::pin(async move {
+    pub fn configure(config: Config) -> anyhow::Result<()> {
+        let rt = Runtime::tokio()?;
+        let spawner = rt.clone();
+        spawner.spawn(Box::pin(async move {
             // let (mut channel_requester, mut declare_exchange_requester)  = {
             let mut msg_receiver = {
                 log::debug!("Taking the channel requester from the global area");
@@ -140,10 +133,10 @@ impl Comms {
                         log::debug!("Validating an existing connection");
                         'connection: loop {
                             match conn.status().state() {
-                                ConnectionState::Initial | ConnectionState::Connecting => {
+                                ConnectionState::Initial | ConnectionState::Connecting | ConnectionState::Reconnecting => {
                                     log::debug!("Connecting is in progress");
                                     // lets check again in a while
-                                    config.reactor.sleep(std::time::Duration::from_millis(100)).await;
+                                    rt.sleep(std::time::Duration::from_millis(100)).await;
                                 }
                                 ConnectionState::Connected => {
                                     // the connection is valid
@@ -190,7 +183,7 @@ impl Comms {
                                 ConnectionState::Error => {
                                     log::warn!("Failed to connect to the rabbit server, will try to reconnect");
                                     log::trace!("Sleeping for {} seconds", config.reconnect_delay.as_secs_f64());
-                                    config.reactor.sleep(config.reconnect_delay).await;
+                                    rt.sleep(config.reconnect_delay).await;
                                     break;
                                 }
                             }
@@ -228,8 +221,6 @@ impl Comms {
                         log::debug!("No connection, attempting to connect [{connection_attempt}]",);
                         let mut properties = ConnectionProperties::default()
                             .with_connection_name(config.name.clone().into());
-                        properties.executor = Some(config.executor.clone());
-                        properties.reactor = Some(config.reactor.clone());
                         properties
                             .client_properties
                             .insert("channel_max".into(), AMQPValue::ShortUInt(MAX_CHANNELS as ShortUInt));
@@ -245,15 +236,15 @@ impl Comms {
                             Err(err) => {
                                 log::error!("Failed to connect: {err}");
                                 log::debug!("Sleeping for {} seconds", config.reconnect_delay.as_secs_f64());
-                                config.reactor.sleep(config.reconnect_delay).await;
+                                rt.sleep(config.reconnect_delay).await;
                             }
                         }
                     }
                 }
             }
         }));
+        Ok(())
     }
-
 }
 
 /// This will dispatch an operation on a channel. If the channel is not
@@ -280,12 +271,15 @@ pub(crate) trait RabbitDispatcher: Sync + Send {
                 channel
             } else {
                 // if the channel is None, we need to request a new channel from the Comms
-                if let Err(err) = channel_requester.send(CommsMsg::RequestChannel(channel_sender.clone())).await {
+                if let Err(err) = channel_requester
+                    .send(CommsMsg::RequestChannel(channel_sender.clone()))
+                    .await
+                {
                     log::error!("Fatal internal error. Failed to request a new channel: {err}");
                     std::process::exit(1);
                 }
                 // now eventually the Channel should arrive over the channel_receiver
-                if let Some(channel) =  channel_receiver.recv().await {
+                if let Some(channel) = channel_receiver.recv().await {
                     log::trace!("Channel received");
                     setup_channel = true;
                     channel
@@ -300,9 +294,7 @@ pub(crate) trait RabbitDispatcher: Sync + Send {
                     log::trace!("No channel, we are going to wait for a new one");
                     continue;
                 }
-                Some(channel) => {
-                  channel
-                }
+                Some(channel) => channel,
             };
 
             if setup_channel {

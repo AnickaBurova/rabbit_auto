@@ -16,11 +16,8 @@
 //     };
 // }
 
-#[cfg(all(feature = "tokio_runtime", feature = "async_std_runtime"))]
-compile_error!("Tokio and Async-std are mutually exclusive");
-
-pub mod config;
 pub mod comms;
+pub mod config;
 pub mod consumer;
 
 pub mod exchanges;
@@ -30,6 +27,5 @@ pub mod publisher;
 pub mod auto_ack;
 
 pub mod stream_builder;
-
 
 pub mod publish_properties;

@@ -1,19 +1,18 @@
 //! Sink wrapper for rabbit publisher.
-use anyhow::{Error};
+use anyhow::Error;
 use lapin::{BasicProperties, Channel};
 
+use crate::comms::{ChannelSender, Comms, CommsMsg, RabbitDispatcher};
 use core::pin::Pin;
 use futures::{
     future::Future,
     task::{Context, Poll},
     Sink,
 };
+use lapin::options::{BasicPublishOptions, ConfirmSelectOptions};
 use std::collections::VecDeque;
 use std::sync::{Arc, Weak};
-use crate::comms::{ChannelSender, Comms, CommsMsg, RabbitDispatcher};
-use lapin::options::{ConfirmSelectOptions, BasicPublishOptions};
 pub mod publisher_properties;
-#[cfg(feature = "tokio_runtime")]
 use tokio::sync::mpsc::{Receiver, Sender as MpscSender};
 
 /// Callback to create confirm select options
@@ -23,8 +22,6 @@ pub type GetBPO = Pin<Box<dyn Fn() -> BasicPublishOptions + Send + Sync>>;
 /// Callback to create basic publish properties
 pub type GetBP = Pin<Box<dyn Fn() -> BasicProperties + Send + Sync>>;
 
-
-
 type SenderFuture<Address> = Pin<Box<dyn Future<Output = IdleData<Address>> + Send>>;
 
 mod serialise;
@@ -32,7 +29,7 @@ pub use serialise::Serialise;
 
 /// Creates a callback which creates the simples case of confirm select options.
 pub fn simple_confirm_options() -> GetCSO {
-    Box::pin(|| lapin::options::ConfirmSelectOptions { nowait: false } )
+    Box::pin(|| lapin::options::ConfirmSelectOptions { nowait: false })
 }
 
 struct IdleData<Address> {
@@ -62,8 +59,7 @@ where
     // type Item = (Item, RoutingKey);
     // type Address = Exchange;
     fn start_sending(mut self, item: (Item, RoutingKey)) -> State<Exchange>
-    where
-    {
+where {
         State::Sending(Box::pin(async move {
             let (item, routing_key) = item;
             let mut channel_receiver = self.channel_receiver.take().unwrap();
@@ -73,15 +69,25 @@ where
                 routing_key,
                 exchange,
                 confirm: self.confirm.take(),
-                publish_options: self.publish_options.as_ref().map(|o| o()).unwrap_or_else(|| BasicPublishOptions::default()),
-                publish_properties: self.publish_properties.as_ref().map(|o|o()).unwrap_or_else(|| BasicProperties::default()),
+                publish_options: self
+                    .publish_options
+                    .as_ref()
+                    .map(|o| o())
+                    .unwrap_or_else(|| BasicPublishOptions::default()),
+                publish_properties: self
+                    .publish_properties
+                    .as_ref()
+                    .map(|o| o())
+                    .unwrap_or_else(|| BasicProperties::default()),
             };
-            let (_, channel) = sender.start_dispatch(
-                Some(self.channel.clone()),
-                &self.channel_sender,
-                &mut channel_receiver,
-                &self.channel_requester
-            ).await;
+            let (_, channel) = sender
+                .start_dispatch(
+                    Some(self.channel.clone()),
+                    &self.channel_sender,
+                    &mut channel_receiver,
+                    &self.channel_requester,
+                )
+                .await;
             self.channel = channel;
             self.confirm = sender.confirm;
             self.address = Some(sender.exchange);
@@ -91,15 +97,15 @@ where
     }
 }
 
-impl<Item, Exchange, RoutingKey> StartSending<Item, (Exchange, RoutingKey)> for IdleData<(Exchange, RoutingKey)>
-    where
-        Item: Unpin + Sync + Send + 'static + Serialise,
-        Exchange: Unpin + AsRef<str> + Sync + Send + 'static,
-        RoutingKey: Unpin + AsRef<str> + Sync + Send + 'static,
+impl<Item, Exchange, RoutingKey> StartSending<Item, (Exchange, RoutingKey)>
+    for IdleData<(Exchange, RoutingKey)>
+where
+    Item: Unpin + Sync + Send + 'static + Serialise,
+    Exchange: Unpin + AsRef<str> + Sync + Send + 'static,
+    RoutingKey: Unpin + AsRef<str> + Sync + Send + 'static,
 {
     fn start_sending(mut self, item: Item) -> State<(Exchange, RoutingKey)>
-        where
-    {
+where {
         State::Sending(Box::pin(async move {
             let mut channel_receiver = self.channel_receiver.take().unwrap();
             let (exchange, routing_key) = self.address.take().unwrap();
@@ -108,15 +114,25 @@ impl<Item, Exchange, RoutingKey> StartSending<Item, (Exchange, RoutingKey)> for 
                 routing_key,
                 exchange,
                 confirm: self.confirm.take(),
-                publish_options: self.publish_options.as_ref().map(|o| o()).unwrap_or_else(|| BasicPublishOptions::default()),
-                publish_properties: self.publish_properties.as_ref().map(|o|o()).unwrap_or_else(|| BasicProperties::default()),
+                publish_options: self
+                    .publish_options
+                    .as_ref()
+                    .map(|o| o())
+                    .unwrap_or_else(|| BasicPublishOptions::default()),
+                publish_properties: self
+                    .publish_properties
+                    .as_ref()
+                    .map(|o| o())
+                    .unwrap_or_else(|| BasicProperties::default()),
             };
-            let (_, channel) = sender.start_dispatch(
-                Some(self.channel.clone()),
-                &self.channel_sender,
-                &mut channel_receiver,
-                &self.channel_requester
-            ).await;
+            let (_, channel) = sender
+                .start_dispatch(
+                    Some(self.channel.clone()),
+                    &self.channel_sender,
+                    &mut channel_receiver,
+                    &self.channel_requester,
+                )
+                .await;
             self.channel = channel;
             self.confirm = sender.confirm;
             self.address = Some((sender.exchange, sender.routing_key));
@@ -126,8 +142,7 @@ impl<Item, Exchange, RoutingKey> StartSending<Item, (Exchange, RoutingKey)> for 
     }
 }
 
-enum State<Address>
-{
+enum State<Address> {
     Idle(IdleData<Address>),
     Sending(SenderFuture<Address>),
 }
@@ -146,7 +161,7 @@ impl<Item, Exchange, RoutingKey> RabbitDispatcher for Sender<Item, RoutingKey, E
 where
     Item: Unpin + Send + Serialise + Sync,
     RoutingKey: AsRef<str> + Send + Sync + Unpin + 'static,
-    Exchange: AsRef<str> + Send + Sync + Unpin +'static,
+    Exchange: AsRef<str> + Send + Sync + Unpin + 'static,
 {
     type Object = ();
     async fn channel_setup(&self, channel: &Channel) -> anyhow::Result<()> {
@@ -163,13 +178,15 @@ where
             return Ok(());
         }
         loop {
-            let publish = channel.basic_publish(
-                self.exchange.as_ref(),
-                self.routing_key.as_ref(),
-                self.publish_options,
-                data.as_ref(),
-                self.publish_properties.clone(),
-            ).await?;
+            let publish = channel
+                .basic_publish(
+                    self.exchange.as_ref(),
+                    self.routing_key.as_ref(),
+                    self.publish_options,
+                    data.as_ref(),
+                    self.publish_properties.clone(),
+                )
+                .await?;
             use lapin::publisher_confirm::Confirmation;
             match (publish.await, self.confirm.is_some()) {
                 (Ok(Confirmation::Ack(None)), true) => {
@@ -191,26 +208,26 @@ where
     }
 }
 
-
-
 /// Sink wrapper for rabbit publisher.
 /// This will never fail after the initial successful creation.
-pub struct PublishWrapper<Item, Address>
-{
+pub struct PublishWrapper<Item, Address> {
     queue: VecDeque<Item>,
     state: Option<State<Address>>,
 }
 
-
-impl <Item, Exchange, RoutingKey> Sink<(Item, RoutingKey)> for PublishWrapper<(Item, RoutingKey), Exchange>
-    where
-        Item: Unpin + Send + Serialise + Sync + 'static,
-        RoutingKey: AsRef<str> + Unpin + Send + Sync + 'static,
-        Exchange: AsRef<str> + Unpin + Send + Sync + 'static,
+impl<Item, Exchange, RoutingKey> Sink<(Item, RoutingKey)>
+    for PublishWrapper<(Item, RoutingKey), Exchange>
+where
+    Item: Unpin + Send + Serialise + Sync + 'static,
+    RoutingKey: AsRef<str> + Unpin + Send + Sync + 'static,
+    Exchange: AsRef<str> + Unpin + Send + Sync + 'static,
 {
     type Error = Error;
 
-    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+    fn poll_ready(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::result::Result<(), Self::Error>> {
         let this = Pin::into_inner(self);
         loop {
             match this.state.take() {
@@ -230,7 +247,10 @@ impl <Item, Exchange, RoutingKey> Sink<(Item, RoutingKey)> for PublishWrapper<(I
                 }
                 Some(State::Idle(data)) => {
                     if let Some(item) = this.queue.pop_front() {
-                        log::trace!("There is an item in the queue, sending it('{}')", item.1.as_ref());
+                        log::trace!(
+                            "There is an item in the queue, sending it('{}')",
+                            item.1.as_ref()
+                        );
                         this.state = Some(data.start_sending(item));
                     } else {
                         log::trace!("No more item in the queue, idling");
@@ -244,22 +264,34 @@ impl <Item, Exchange, RoutingKey> Sink<(Item, RoutingKey)> for PublishWrapper<(I
         }
     }
 
-    fn start_send(self: Pin<&mut Self>, item: (Item, RoutingKey)) -> std::result::Result<(), Self::Error> {
-        log::trace!("Sending an item with a dynamic key ('{}'), pushing the item to the queue", item.1.as_ref());
+    fn start_send(
+        self: Pin<&mut Self>,
+        item: (Item, RoutingKey),
+    ) -> std::result::Result<(), Self::Error> {
+        log::trace!(
+            "Sending an item with a dynamic key ('{}'), pushing the item to the queue",
+            item.1.as_ref()
+        );
         let this = Pin::into_inner(self);
         this.queue.push_back(item);
         Ok(())
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::result::Result<(), Self::Error>> {
         Self::poll_ready(self, cx)
     }
 
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+    fn poll_close(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::result::Result<(), Self::Error>> {
         Self::poll_ready(self, cx)
     }
 }
-impl <Item, Exchange, RoutingKey> Sink<Item> for PublishWrapper<Item,(Exchange, RoutingKey)>
+impl<Item, Exchange, RoutingKey> Sink<Item> for PublishWrapper<Item, (Exchange, RoutingKey)>
 where
     Item: Unpin + Sync + Send + 'static + Serialise,
     Exchange: Unpin + AsRef<str> + Sync + Send + 'static,
@@ -267,7 +299,10 @@ where
 {
     type Error = Error;
 
-    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+    fn poll_ready(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::result::Result<(), Self::Error>> {
         let this = Pin::into_inner(self);
         loop {
             match this.state.take() {
@@ -308,20 +343,26 @@ where
         Ok(())
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::result::Result<(), Self::Error>> {
         Self::poll_ready(self, cx)
     }
 
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+    fn poll_close(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::result::Result<(), Self::Error>> {
         Self::poll_ready(self, cx)
     }
 }
 
-
-impl<T,E,K> PublishWrapper<T, (E, K)>
-    where T: Unpin + Send + Serialise,
-          E: AsRef<str> + Send + Unpin + 'static,
-          K: AsRef<str> + Send + Unpin + 'static,
+impl<T, E, K> PublishWrapper<T, (E, K)>
+where
+    T: Unpin + Send + Serialise,
+    E: AsRef<str> + Send + Unpin + 'static,
+    K: AsRef<str> + Send + Unpin + 'static,
 {
     /// Creates a publisher with a static routing key.
     /// The routing key is provided during creation of the publisher and is static.
@@ -332,25 +373,27 @@ impl<T,E,K> PublishWrapper<T, (E, K)>
         confirm: Option<GetCSO>,
         publish_options: Option<GetBPO>,
         publish_properties: Option<GetBP>,
-    ) -> Self
-    {
-        log::trace!("Creating a publisher on exchange {} with a static routing key {}", exchange.as_ref(),
-        routing_key.as_ref());
+    ) -> Self {
+        log::trace!(
+            "Creating a publisher on exchange {} with a static routing key {}",
+            exchange.as_ref(),
+            routing_key.as_ref()
+        );
         PublisherInitialiser::create::<T, (E, K)>(
-            ( exchange, routing_key),
+            (exchange, routing_key),
             confirm,
             publish_options,
-            publish_properties
+            publish_properties,
         )
     }
 }
 
-impl<T,E,K> PublishWrapper<(T,K), E>
-    where T: Unpin + Send + Serialise,
-          E: AsRef<str> + Send + Unpin + 'static,
-          K: AsRef<str> + Send + Unpin + 'static,
+impl<T, E, K> PublishWrapper<(T, K), E>
+where
+    T: Unpin + Send + Serialise,
+    E: AsRef<str> + Send + Unpin + 'static,
+    K: AsRef<str> + Send + Unpin + 'static,
 {
-
     /// Creates a publisher with a dynamic routing key.
     /// The Sink is expecting the item and the routing key.
     pub async fn with_dynamic_key(
@@ -358,15 +401,16 @@ impl<T,E,K> PublishWrapper<(T,K), E>
         confirm: Option<GetCSO>,
         publish_options: Option<GetBPO>,
         publish_properties: Option<GetBP>,
-    ) -> Self
-    {
-        log::trace!("Creating a publisher on exchange {} with a dynamic routing key", exchange.as_ref()
+    ) -> Self {
+        log::trace!(
+            "Creating a publisher on exchange {} with a dynamic routing key",
+            exchange.as_ref()
         );
         PublisherInitialiser::create::<(T, K), E>(
             exchange,
             confirm,
             publish_options,
-            publish_properties
+            publish_properties,
         )
     }
 }
@@ -374,28 +418,27 @@ impl<T,E,K> PublishWrapper<(T,K), E>
 struct PublisherInitialiser;
 
 impl PublisherInitialiser {
-    fn create<I, A>(address: A,
-                    confirm: Option<GetCSO>,
-                    publish_options: Option<GetBPO>,
-                    publish_properties: Option<GetBP>,
+    fn create<I, A>(
+        address: A,
+        confirm: Option<GetCSO>,
+        publish_options: Option<GetBPO>,
+        publish_properties: Option<GetBP>,
     ) -> PublishWrapper<I, A> {
         log::trace!("Creating rabbit channel internals");
         let channel_requester = Comms::get_channel_comms();
         let (channel_sender, channel_receiver) = Comms::create_channel_channel();
-        PublishWrapper::<I,A>{
+        PublishWrapper::<I, A> {
             queue: VecDeque::new(),
-            state: Some(
-                State::Idle(IdleData::<A> {
-                    channel: Weak::default(),
-                    address: Some(address),
-                    confirm,
-                    publish_options,
-                    publish_properties,
-                    channel_sender,
-                    channel_receiver: Some(channel_receiver),
-                    channel_requester,
-                })
-            )
+            state: Some(State::Idle(IdleData::<A> {
+                channel: Weak::default(),
+                address: Some(address),
+                confirm,
+                publish_options,
+                publish_properties,
+                channel_sender,
+                channel_receiver: Some(channel_receiver),
+                channel_requester,
+            })),
         }
     }
 }
