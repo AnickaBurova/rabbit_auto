@@ -1,6 +1,6 @@
 [package]
 name = "rabbit-auto"
-version = "0.7.0"
+version = "0.8.0"
 authors = ["Anicka Burova <anicka.burova@gmail.com>"]
 edition = "2018"
 license = "MIT"
@@ -9,8 +9,10 @@ repository = "https://github.com/AnickaBurova/rabbit_auto"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [features]
+default = ["chrono", "tokio_stream"]
 humantime = ["humantime_library"]
 chrono = ["chrono_library"]
+tokio_stream = ["tokio_stream_library"]
 
 [dependencies]
 anyhow = "1.0.100"
@@ -27,3 +29,4 @@ async-trait = "0.1.89"
 humantime_library = { package = "humantime", version = "2.3.0", optional = true }
 chrono_library = { package = "chrono", version = "0.4.43", optional = true }
 async-rs = "0.8.0"
+tokio_stream_library = { package = "tokio-stream", version = "0.1.18", optional = true }

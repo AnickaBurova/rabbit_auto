@@ -29,3 +29,6 @@ pub mod auto_ack;
 pub mod stream_builder;
 
 pub mod publish_properties;
+
+#[cfg(all(feature = "tokio_stream", feature = "chrono"))]
+pub mod multi_auto_ack;

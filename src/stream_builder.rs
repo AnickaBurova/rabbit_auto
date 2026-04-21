@@ -1,14 +1,16 @@
 // #[cfg(feature = "async_std_runtime")]
 // use async_std::sync::RwLock;
-use futures::{StreamExt};
-use crate::auto_ack::{AutoAck, auto_ack};
-use lapin::{Channel, Consumer};
+use crate::auto_ack::{auto_ack, AutoAck};
+use crate::comms::RabbitDispatcher;
 use crate::consumer::ConsumerWrapper;
+#[cfg(all(feature = "tokio_stream", feature = "chrono"))]
+use crate::multi_auto_ack::AutoAckMulti;
 use anyhow::Result;
+use futures::StreamExt;
 use lapin::acker::Acker;
 use lapin::message::Delivery;
 use lapin::options::QueueDeleteOptions;
-use crate::comms::{RabbitDispatcher};
+use lapin::{Channel, Consumer};
 
 #[derive(Default)]
 pub struct StreamBuilderWithName<Q, T, K, E> {
@@ -33,37 +35,52 @@ pub struct StreamBuilderWithName<Q, T, K, E> {
 
 #[async_trait::async_trait]
 impl<Q, T, K, E> RabbitDispatcher for StreamBuilderWithName<Q, T, K, E>
-    where T: AsRef<str> + Send + Unpin + 'static + Clone + Sync,
-          K: AsRef<str> + Send + Unpin + 'static + Clone + Sync,
-          E: AsRef<str> + Send + Unpin + 'static + Clone + Sync,
-          Q: AsRef<str> + Send + Unpin + 'static + Clone + Sync,
+where
+    T: AsRef<str> + Send + Unpin + 'static + Clone + Sync,
+    K: AsRef<str> + Send + Unpin + 'static + Clone + Sync,
+    E: AsRef<str> + Send + Unpin + 'static + Clone + Sync,
+    Q: AsRef<str> + Send + Unpin + 'static + Clone + Sync,
 {
     type Object = Consumer;
 
     async fn dispatcher(&self, channel: &Channel) -> Result<Self::Object> {
         let consumer = {
             if let Some((qos, options)) = self.qos {
-                channel.basic_qos(qos,
-                                  options.unwrap_or_else(|| lapin::options::BasicQosOptions::default())
-                ).await?;
+                channel
+                    .basic_qos(
+                        qos,
+                        options.unwrap_or_else(|| lapin::options::BasicQosOptions::default()),
+                    )
+                    .await?;
             }
             let queue_name = if let Some(queue_name) = self.queue_name.as_ref() {
                 queue_name.as_ref()
             } else {
                 self.routing_key.as_ref()
             };
-            if let Err(err) = channel.queue_declare(queue_name,
-                                                    self.declare
-                                                        .unwrap_or_else(|| lapin::options::QueueDeclareOptions::default()),
-                                                    self.declare_fields.clone().unwrap_or_else(|| lapin::types::FieldTable::default()),
-            ).await {
+            if let Err(err) = channel
+                .queue_declare(
+                    queue_name,
+                    self.declare
+                        .unwrap_or_else(|| lapin::options::QueueDeclareOptions::default()),
+                    self.declare_fields
+                        .clone()
+                        .unwrap_or_else(|| lapin::types::FieldTable::default()),
+                )
+                .await
+            {
                 log::warn!("Deleting incompatible queue: {}", err);
                 if self.incompatible_delete {
-                    let msgs = channel.queue_delete(queue_name, QueueDeleteOptions {
-                        if_unused: false,
-                        if_empty: false,
-                        nowait: true,
-                    }).await?;
+                    let msgs = channel
+                        .queue_delete(
+                            queue_name,
+                            QueueDeleteOptions {
+                                if_unused: false,
+                                if_empty: false,
+                                nowait: true,
+                            },
+                        )
+                        .await?;
                     log::warn!("Incompatible queue deleted");
                     if msgs > 0 {
                         log::warn!("Deleting the previous queue purged {} messages", msgs);
@@ -80,16 +97,22 @@ impl<Q, T, K, E> RabbitDispatcher for StreamBuilderWithName<Q, T, K, E>
                     queue_name,
                     self.exchange.as_ref(),
                     self.routing_key.as_ref(),
-                    self.binding.unwrap_or_else(|| lapin::options::QueueBindOptions::default()),
-                    self.binding_fields.clone().unwrap_or_else(|| lapin::types::FieldTable::default()),
+                    self.binding
+                        .unwrap_or_else(|| lapin::options::QueueBindOptions::default()),
+                    self.binding_fields
+                        .clone()
+                        .unwrap_or_else(|| lapin::types::FieldTable::default()),
                 )
                 .await?;
             channel
                 .basic_consume(
                     queue_name,
                     self.tag.as_ref(),
-                    self.consume.unwrap_or_else(|| lapin::options::BasicConsumeOptions::default()),
-                    self.consume_fields.clone().unwrap_or_else(|| lapin::types::FieldTable::default()),
+                    self.consume
+                        .unwrap_or_else(|| lapin::options::BasicConsumeOptions::default()),
+                    self.consume_fields
+                        .clone()
+                        .unwrap_or_else(|| lapin::types::FieldTable::default()),
                 )
                 .await?
         };
@@ -101,14 +124,14 @@ pub trait Deserialise: Sized {
     fn deserialise(data: Vec<u8>) -> Result<Self>;
 }
 
-
 pub mod queue_options;
 
-impl<Q, T,K,E> StreamBuilderWithName<Q, T, K, E>
-    where T: AsRef<str> + Send + Unpin + 'static + Clone + Sync,
-          K: AsRef<str> + Send + Unpin + 'static + Clone + Sync,
-          E: AsRef<str> + Send + Unpin + 'static + Clone + Sync,
-          Q: AsRef<str> + Send + Unpin + 'static + Clone + Sync,
+impl<Q, T, K, E> StreamBuilderWithName<Q, T, K, E>
+where
+    T: AsRef<str> + Send + Unpin + 'static + Clone + Sync,
+    K: AsRef<str> + Send + Unpin + 'static + Clone + Sync,
+    E: AsRef<str> + Send + Unpin + 'static + Clone + Sync,
+    Q: AsRef<str> + Send + Unpin + 'static + Clone + Sync,
 {
     /// Creates a consumer which returns channel and the delivery.
     pub async fn create_plain(self) -> impl StreamExt<Item = Delivery> + Unpin + Send {
@@ -116,18 +139,63 @@ impl<Q, T,K,E> StreamBuilderWithName<Q, T, K, E>
     }
 
     /// Creates a consumer which returns an acker and the deserialised item
-    pub async fn create<I: Deserialise>(self) -> impl StreamExt<Item = (Acker, Result<I>)> + Unpin + Send {
+    pub async fn create<I: Deserialise>(
+        self,
+    ) -> impl StreamExt<Item = (Acker, Result<I>)> + Unpin + Send {
         let consumer = self.create_plain().await;
-        consumer.map(| delivery| (delivery.acker, I::deserialise(delivery.data)))
+        consumer.map(|delivery| (delivery.acker, I::deserialise(delivery.data)))
     }
 
     /// Creates a consumer which returns autoack and the item
-    pub async fn create_auto_ack<I: Deserialise>(self) -> impl StreamExt<Item = (AutoAck, Result<I>)> + Unpin + Send {
+    pub async fn create_auto_ack<I: Deserialise>(
+        self,
+    ) -> impl StreamExt<Item = (AutoAck, Result<I>)> + Unpin + Send {
         let consumer = self.create_plain().await;
         auto_ack(consumer).map(|(ack, delivery)| (ack, I::deserialise(delivery)))
     }
-}
 
+    #[cfg(all(feature = "tokio_stream", feature = "chrono"))]
+    pub async fn create_multi_auto_ack<I: Deserialise + Send + 'static>(
+        self,
+        period: chrono_library::Duration,
+        bounded_buffer_size: usize,
+    ) -> impl StreamExt<Item = (AutoAckMulti, Result<I>)> + Unpin + Send {
+        let mut consumer = self.create_plain().await;
+        let (sx, rx) = tokio::sync::mpsc::channel(bounded_buffer_size);
+        tokio::spawn(async move {
+            let (sc_tick, mut rx_tick) = tokio::sync::mpsc::channel(4);
+            tokio::spawn(async move {
+                let period = period.to_std().unwrap();
+                loop {
+                    tokio::time::sleep(period).await;
+                    sc_tick.send(()).await.unwrap();
+                }
+            });
+            let (mut commits, mut action_receiver) = crate::multi_auto_ack::Commits::new();
+            loop {
+                tokio::select! {
+                    Some(delivery) = consumer.next() => {
+                        let (ack, data) = commits.add_message(delivery);
+                        sx.send((ack, I::deserialise(data))).await.unwrap();
+                    }
+                    Some(action) = action_receiver.recv() => {
+                        commits.commit_tag(action);
+                    }
+                    _ = rx_tick.recv() => {
+                        log::warn!("Performing auto-acking");
+                        // Drain all decisions that arrived since the last tick
+                        // before flushing, so the batch is as complete as possible.
+                        while let Ok(action) = action_receiver.try_recv() {
+                            commits.commit_tag(action);
+                        }
+                        commits.perform_auto_acking().await.unwrap();
+                    }
+                }
+            }
+        });
+        tokio_stream_library::wrappers::ReceiverStream::new(rx)
+    }
+}
 
 #[derive(Clone, Default)]
 pub struct StreamBuilder<T, K, E> {
@@ -167,26 +235,71 @@ impl<T, K, E> StreamBuilder<T, K, E> {
     }
 }
 
-
 impl<T, K, E> StreamBuilder<T, K, E>
-    where T: AsRef<str> + Send + Unpin + 'static + Clone + Sync,
-          K: AsRef<str> + Send + Unpin + 'static + Clone + Sync,
-          E: AsRef<str> + Send + Unpin + 'static + Clone + Sync,
+where
+    T: AsRef<str> + Send + Unpin + 'static + Clone + Sync,
+    K: AsRef<str> + Send + Unpin + 'static + Clone + Sync,
+    E: AsRef<str> + Send + Unpin + 'static + Clone + Sync,
 {
     /// Creates a consumer which returns channel and the delivery.
     pub async fn create_plain(self) -> impl StreamExt<Item = Delivery> + Unpin + Send {
-            self.into_with_name().create_plain().await
+        self.into_with_name().create_plain().await
     }
 
     /// Creates a consumer which returns an acker and the deserialised item
-    pub async fn create<I: Deserialise>(self) -> impl StreamExt<Item = (Acker, Result<I>)> + Unpin + Send {
+    pub async fn create<I: Deserialise>(
+        self,
+    ) -> impl StreamExt<Item = (Acker, Result<I>)> + Unpin + Send {
         let consumer = self.create_plain().await;
-        consumer.map(| delivery| (delivery.acker, I::deserialise(delivery.data)))
+        consumer.map(|delivery| (delivery.acker, I::deserialise(delivery.data)))
     }
 
     /// Creates a consumer which returns autoack and the item
-    pub async fn create_auto_ack<I: Deserialise>(self) -> impl StreamExt<Item = (AutoAck, Result<I>)> + Unpin + Send {
+    pub async fn create_auto_ack<I: Deserialise>(
+        self,
+    ) -> impl StreamExt<Item = (AutoAck, Result<I>)> + Unpin + Send {
         let consumer = self.create_plain().await;
         auto_ack(consumer).map(|(ack, delivery)| (ack, I::deserialise(delivery)))
+    }
+
+    #[cfg(all(feature = "tokio_stream", feature = "chrono"))]
+    pub async fn create_multi_auto_ack<I: Deserialise + Send + 'static>(
+        self,
+        period: chrono_library::Duration,
+        bounded_buffer_size: usize,
+    ) -> impl StreamExt<Item = (AutoAckMulti, Result<I>)> + Unpin + Send {
+        let mut consumer = self.create_plain().await;
+        let (sx, rx) = tokio::sync::mpsc::channel(bounded_buffer_size);
+        tokio::spawn(async move {
+            let (sc_tick, mut rx_tick) = tokio::sync::mpsc::channel(4);
+            tokio::spawn(async move {
+                let period = period.to_std().unwrap();
+                loop {
+                    tokio::time::sleep(period).await;
+                    sc_tick.send(()).await.unwrap();
+                }
+            });
+            let (mut commits, mut action_receiver) = crate::multi_auto_ack::Commits::new();
+            loop {
+                tokio::select! {
+                    Some(delivery) = consumer.next() => {
+                        let (ack, data) = commits.add_message(delivery);
+                        sx.send((ack, I::deserialise(data))).await.unwrap();
+                    }
+                    Some(action) = action_receiver.recv() => {
+                        commits.commit_tag(action);
+                    }
+                    _ = rx_tick.recv() => {
+                        // Drain all decisions that arrived since the last tick
+                        // before flushing, so the batch is as complete as possible.
+                        while let Ok(action) = action_receiver.try_recv() {
+                            commits.commit_tag(action);
+                        }
+                        commits.perform_auto_acking().await.unwrap();
+                    }
+                }
+            }
+        });
+        tokio_stream_library::wrappers::ReceiverStream::new(rx)
     }
 }
