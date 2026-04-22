@@ -33,6 +33,7 @@ pub fn simple_confirm_options() -> GetCSO {
 }
 
 struct IdleData<Address> {
+    wait_for_confirm: bool,
     address: Option<Address>,
     channel: Weak<Channel>,
     confirm: Option<GetCSO>,
@@ -65,6 +66,7 @@ where {
             let mut channel_receiver = self.channel_receiver.take().unwrap();
             let exchange = self.address.take().unwrap();
             let sender = Sender {
+                wait_for_confirm: self.wait_for_confirm,
                 item,
                 routing_key,
                 exchange,
@@ -110,6 +112,7 @@ where {
             let mut channel_receiver = self.channel_receiver.take().unwrap();
             let (exchange, routing_key) = self.address.take().unwrap();
             let sender = Sender {
+                wait_for_confirm: self.wait_for_confirm,
                 item,
                 routing_key,
                 exchange,
@@ -151,6 +154,7 @@ struct Sender<Item, RoutingKey, Exchange> {
     item: Item,
     routing_key: RoutingKey,
     exchange: Exchange,
+    wait_for_confirm: bool,
     confirm: Option<GetCSO>,
     publish_options: BasicPublishOptions,
     publish_properties: BasicProperties,
@@ -166,7 +170,7 @@ where
     type Object = ();
     async fn channel_setup(&self, channel: &Channel) -> anyhow::Result<()> {
         if let Some(confirm) = self.confirm.as_ref() {
-            log::trace!("Setting up the confirm on the channel");
+            tracing::trace!("Setting up the confirm on the channel");
             channel.confirm_select(confirm()).await?;
         }
         Ok(())
@@ -174,7 +178,7 @@ where
     async fn dispatcher(&self, channel: &Channel) -> anyhow::Result<()> {
         let data = Item::serialise(&self.item);
         if data.as_ref().is_empty() {
-            log::trace!("Serialised data from the item are empty, skipping the publish");
+            tracing::trace!("Serialised data from the item are empty, skipping the publish");
             return Ok(());
         }
         loop {
@@ -187,21 +191,23 @@ where
                     self.publish_properties.clone(),
                 )
                 .await?;
-            use lapin::publisher_confirm::Confirmation;
-            match (publish.await, self.confirm.is_some()) {
-                (Ok(Confirmation::Ack(None)), true) => {
-                    log::trace!("Publish on the channel {} is confirmed", channel.id());
-                    return Ok(());
-                }
-                (Ok(_), true) => {
-                    log::error!("Failed to confirm the published message on the channel {}, repeating the send", channel.id());
-                }
-                (Err(err), _) => {
-                    log::error!("Failed to publish the message on the channel {}, repeating the send: {err}", channel.id());
-                }
-                (_, false) => {
-                    log::trace!("Published");
-                    return Ok(());
+            if self.wait_for_confirm {
+                use lapin::publisher_confirm::Confirmation;
+                match (publish.await, self.confirm.is_some()) {
+                    (Ok(Confirmation::Ack(None)), true) => {
+                        tracing::trace!("Publish on the channel {} is confirmed", channel.id());
+                        return Ok(());
+                    }
+                    (Ok(_), true) => {
+                        tracing::error!("Failed to confirm the published message on the channel {}, repeating the send", channel.id());
+                    }
+                    (Err(err), _) => {
+                        tracing::error!("Failed to publish the message on the channel {}, repeating the send: {err}", channel.id());
+                    }
+                    (_, false) => {
+                        tracing::trace!("Published");
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -235,25 +241,25 @@ where
                     let action = sender.as_mut();
                     match Future::poll(action, cx) {
                         Poll::Pending => {
-                            log::trace!("Sending is still pending");
+                            tracing::trace!("Sending is still pending");
                             this.state = Some(State::Sending(sender));
                             return Poll::Pending;
                         }
                         Poll::Ready(data) => {
-                            log::trace!("Sending is done");
+                            tracing::trace!("Sending is done");
                             this.state = Some(State::Idle(data));
                         }
                     }
                 }
                 Some(State::Idle(data)) => {
                     if let Some(item) = this.queue.pop_front() {
-                        log::trace!(
+                        tracing::trace!(
                             "There is an item in the queue, sending it('{}')",
                             item.1.as_ref()
                         );
                         this.state = Some(data.start_sending(item));
                     } else {
-                        log::trace!("No more item in the queue, idling");
+                        tracing::trace!("No more item in the queue, idling");
                         this.state = Some(State::Idle(data));
                         return Poll::Ready(Ok(()));
                     }
@@ -268,7 +274,7 @@ where
         self: Pin<&mut Self>,
         item: (Item, RoutingKey),
     ) -> std::result::Result<(), Self::Error> {
-        log::trace!(
+        tracing::trace!(
             "Sending an item with a dynamic key ('{}'), pushing the item to the queue",
             item.1.as_ref()
         );
@@ -310,22 +316,22 @@ where
                     let action = sender.as_mut();
                     match Future::poll(action, cx) {
                         Poll::Pending => {
-                            log::trace!("Sending is still pending");
+                            tracing::trace!("Sending is still pending");
                             this.state = Some(State::Sending(sender));
                             return Poll::Pending;
                         }
                         Poll::Ready(data) => {
-                            log::trace!("Sending is done");
+                            tracing::trace!("Sending is done");
                             this.state = Some(State::Idle(data));
                         }
                     }
                 }
                 Some(State::Idle(data)) => {
                     if let Some(item) = this.queue.pop_front() {
-                        log::trace!("There is an item in the queue, sending it");
+                        tracing::trace!("There is an item in the queue, sending it");
                         this.state = Some(data.start_sending(item));
                     } else {
-                        log::trace!("No more item in the queue, idling");
+                        tracing::trace!("No more item in the queue, idling");
                         this.state = Some(State::Idle(data));
                         return Poll::Ready(Ok(()));
                     }
@@ -337,7 +343,7 @@ where
     }
 
     fn start_send(self: Pin<&mut Self>, item: Item) -> std::result::Result<(), Self::Error> {
-        log::trace!("Sending an item with a static key, pushing the item to the queue");
+        tracing::trace!("Sending an item with a static key, pushing the item to the queue");
         let this = Pin::into_inner(self);
         this.queue.push_back(item);
         Ok(())
@@ -370,17 +376,19 @@ where
     pub async fn with_static_key(
         exchange: E,
         routing_key: K,
+        wait_for_confirm: bool,
         confirm: Option<GetCSO>,
         publish_options: Option<GetBPO>,
         publish_properties: Option<GetBP>,
     ) -> Self {
-        log::trace!(
+        tracing::trace!(
             "Creating a publisher on exchange {} with a static routing key {}",
             exchange.as_ref(),
             routing_key.as_ref()
         );
         PublisherInitialiser::create::<T, (E, K)>(
             (exchange, routing_key),
+            wait_for_confirm,
             confirm,
             publish_options,
             publish_properties,
@@ -398,16 +406,18 @@ where
     /// The Sink is expecting the item and the routing key.
     pub async fn with_dynamic_key(
         exchange: E,
+        wait_for_confirm: bool,
         confirm: Option<GetCSO>,
         publish_options: Option<GetBPO>,
         publish_properties: Option<GetBP>,
     ) -> Self {
-        log::trace!(
+        tracing::trace!(
             "Creating a publisher on exchange {} with a dynamic routing key",
             exchange.as_ref()
         );
         PublisherInitialiser::create::<(T, K), E>(
             exchange,
+            wait_for_confirm,
             confirm,
             publish_options,
             publish_properties,
@@ -420,11 +430,12 @@ struct PublisherInitialiser;
 impl PublisherInitialiser {
     fn create<I, A>(
         address: A,
+        wait_for_confirm: bool,
         confirm: Option<GetCSO>,
         publish_options: Option<GetBPO>,
         publish_properties: Option<GetBP>,
     ) -> PublishWrapper<I, A> {
-        log::trace!("Creating rabbit channel internals");
+        tracing::trace!("Creating rabbit channel internals");
         let channel_requester = Comms::get_channel_comms();
         let (channel_sender, channel_receiver) = Comms::create_channel_channel();
         PublishWrapper::<I, A> {
@@ -432,6 +443,7 @@ impl PublisherInitialiser {
             state: Some(State::Idle(IdleData::<A> {
                 channel: Weak::default(),
                 address: Some(address),
+                wait_for_confirm,
                 confirm,
                 publish_options,
                 publish_properties,
