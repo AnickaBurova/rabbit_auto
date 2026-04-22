@@ -1,4 +1,4 @@
-//! Helper to create a connection and keep it connected.
+//! Global connection manager ([`Comms`]) and the internal channel-dispatch machinery.
 
 use async_rs::traits::{Executor, Reactor};
 use async_rs::Runtime;
@@ -26,7 +26,15 @@ pub type ChannelSender = Arc<Sender<Weak<Channel>>>;
 
 // mod comms_data;
 
-/// RabbitMQ connection singleton
+/// Global RabbitMQ connection manager.
+///
+/// `Comms` is a process-wide singleton.  Call [`Comms::configure`] once at
+/// startup to start the background connection loop, then use
+/// [`Comms::declare_exchange`] to register any exchanges that consumers or
+/// publishers depend on.
+///
+/// Consumers and publishers obtain AMQP channels through `Comms` automatically;
+/// you do not interact with channels directly.
 pub struct Comms;
 /// Internal size of the channel buffer
 const COMMS_MSG_SIZE: usize = 32;
@@ -40,7 +48,30 @@ pub(crate) enum CommsMsg {
 }
 
 impl Comms {
-    /// Declare exchange
+    /// Register an exchange declaration that will be (re-)run on every connection.
+    ///
+    /// Exchanges are declared once when the connection is first established and
+    /// again automatically after every reconnect, so the topology is always in
+    /// sync with the broker.
+    ///
+    /// Build the `declare` argument with one of the helpers in
+    /// [`crate::exchanges`]: [`create_direct_exchange`](crate::exchanges::create_direct_exchange),
+    /// [`create_topic_exchange`](crate::exchanges::create_topic_exchange), or
+    /// the lower-level [`create_exchange`](crate::exchanges::create_exchange).
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use rabbit_auto::comms::Comms;
+    /// use rabbit_auto::exchanges::create_topic_exchange;
+    ///
+    /// # async fn example() {
+    /// Comms::declare_exchange(
+    ///     "events".to_string(),
+    ///     create_topic_exchange("events".to_string(), None, None),
+    /// ).await;
+    /// # }
+    /// ```
     pub async fn declare_exchange(exchange: String, declare: DeclareExchange) {
         let sender = Self::channel_comms().0;
         tracing::debug!("Sending {exchange} declaration to the rabbit loop");
@@ -80,8 +111,31 @@ impl Comms {
         (Arc::new(tx), rx)
     }
 
-    /// The connection needs to be configured before the first using
-    /// This is no longer async method and this will start the rabbit auto connection manager.
+    /// Start the background connection manager.
+    ///
+    /// Must be called **once** before creating any consumers or publishers.
+    /// Calling it a second time is a fatal error (the process will exit).
+    ///
+    /// This is a synchronous function — it spawns the connection loop onto the
+    /// async runtime and returns immediately.  The loop will keep retrying until
+    /// the first connection is established, and will transparently reconnect
+    /// whenever the connection is lost.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use rabbit_auto::comms::Comms;
+    /// use rabbit_auto::config::Config;
+    /// use std::time::Duration;
+    ///
+    /// Comms::configure(Config::new(
+    ///     "my-service".to_string(),
+    ///     ["localhost:5672"].iter(),
+    ///     "guest",
+    ///     "guest",
+    ///     Duration::from_secs(3),
+    /// )).expect("Failed to initialise connection manager");
+    /// ```
     pub fn configure(config: Config) -> anyhow::Result<()> {
         let rt = Runtime::tokio()?;
         let spawner = rt.clone();

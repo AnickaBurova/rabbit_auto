@@ -1,4 +1,4 @@
-//! Sink wrapper for rabbit publisher.
+//! Auto-reconnecting publisher ([`PublishWrapper`]) and supporting types.
 use anyhow::Error;
 use lapin::{BasicProperties, Channel};
 
@@ -27,7 +27,33 @@ type SenderFuture<Address> = Pin<Box<dyn Future<Output = IdleData<Address>> + Se
 mod serialise;
 pub use serialise::Serialise;
 
-/// Creates a callback which creates the simples case of confirm select options.
+/// Returns a [`GetCSO`] callback that enables publisher confirms with `nowait = false`.
+///
+/// Pass this to [`PublishWrapper::with_static_key`] or [`PublishWrapper::with_dynamic_key`]
+/// together with `wait_for_confirm: true` when you need delivery guarantees.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use rabbit_auto::publisher::{PublishWrapper, Serialise, simple_confirm_options};
+/// use std::borrow::Cow;
+///
+/// struct Msg(Vec<u8>);
+/// impl Serialise for Msg {
+///     fn serialise(data: &Self) -> Cow<'_, [u8]> { data.0.as_slice().into() }
+/// }
+///
+/// # async fn example() {
+/// let publisher = PublishWrapper::<Msg, _>::with_static_key(
+///     "my-exchange",
+///     "my.key",
+///     true,                          // wait for broker ack
+///     Some(simple_confirm_options()),
+///     None,
+///     None,
+/// ).await;
+/// # }
+/// ```
 pub fn simple_confirm_options() -> GetCSO {
     Box::pin(|| lapin::options::ConfirmSelectOptions { nowait: false })
 }
@@ -214,8 +240,25 @@ where
     }
 }
 
-/// Sink wrapper for rabbit publisher.
-/// This will never fail after the initial successful creation.
+/// An auto-reconnecting RabbitMQ publisher that implements [`futures::Sink`].
+///
+/// Create one via [`PublishWrapper::with_static_key`] (routing key fixed at
+/// construction) or [`PublishWrapper::with_dynamic_key`] (routing key supplied
+/// with each message).
+///
+/// After the first successful connection the sink never surfaces a connection
+/// error — it will block internally until the broker is reachable again, then
+/// retry the in-flight message.
+///
+/// Messages that serialise to an empty byte slice (see [`Serialise`]) are
+/// silently dropped.
+///
+/// # Type parameters
+///
+/// * `Item` — the message type; must implement [`Serialise`].
+/// * `Address` — either `(Exchange, RoutingKey)` for static routing or just
+///   `Exchange` for dynamic routing.  Use the constructors rather than spelling
+///   this out by hand.
 pub struct PublishWrapper<Item, Address> {
     queue: VecDeque<Item>,
     state: Option<State<Address>>,
@@ -370,9 +413,51 @@ where
     E: AsRef<str> + Send + Unpin + 'static,
     K: AsRef<str> + Send + Unpin + 'static,
 {
-    /// Creates a publisher with a static routing key.
-    /// The routing key is provided during creation of the publisher and is static.
-    /// The Sink is expecting only the item to publish.
+    /// Creates a publisher with a **fixed** routing key.
+    ///
+    /// The resulting sink accepts `Item` values directly — the routing key is
+    /// bound at construction time and never changes.
+    ///
+    /// # Arguments
+    ///
+    /// * `exchange` — name of the exchange to publish to.
+    /// * `routing_key` — routing key used for every message.
+    /// * `wait_for_confirm` — when `true`, the publisher waits for a broker
+    ///   `Ack` before completing each send.  Requires `confirm` to be `Some`.
+    ///   Set to `false` for fire-and-forget publishing.
+    /// * `confirm` — publisher-confirm options; use [`simple_confirm_options`]
+    ///   or `None` to disable confirms entirely.
+    /// * `publish_options` — AMQP basic-publish options; `None` uses defaults.
+    /// * `publish_properties` — AMQP message properties (expiration, delivery
+    ///   mode, …); `None` uses defaults.  See [`crate::publish_properties`] and
+    ///   [`crate::publisher::publisher_properties`] for helpers.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use rabbit_auto::publisher::{PublishWrapper, Serialise};
+    /// use futures::SinkExt;
+    /// use std::borrow::Cow;
+    ///
+    /// struct Event(String);
+    /// impl Serialise for Event {
+    ///     fn serialise(data: &Self) -> Cow<'_, [u8]> { data.0.as_bytes().into() }
+    /// }
+    ///
+    /// # async fn example() -> anyhow::Result<()> {
+    /// let mut publisher = PublishWrapper::<Event, _>::with_static_key(
+    ///     "events",
+    ///     "user.created",
+    ///     false, // fire-and-forget
+    ///     None,
+    ///     None,
+    ///     None,
+    /// ).await;
+    ///
+    /// publisher.send(Event("{}".to_string())).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn with_static_key(
         exchange: E,
         routing_key: K,
@@ -402,8 +487,39 @@ where
     E: AsRef<str> + Send + Unpin + 'static,
     K: AsRef<str> + Send + Unpin + 'static,
 {
-    /// Creates a publisher with a dynamic routing key.
-    /// The Sink is expecting the item and the routing key.
+    /// Creates a publisher with a **per-message** routing key.
+    ///
+    /// The resulting sink accepts `(Item, RoutingKey)` tuples, so the routing
+    /// key can differ for each message.
+    ///
+    /// All other arguments behave identically to [`PublishWrapper::with_static_key`].
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use rabbit_auto::publisher::{PublishWrapper, Serialise};
+    /// use futures::SinkExt;
+    /// use std::borrow::Cow;
+    ///
+    /// struct Event(String);
+    /// impl Serialise for Event {
+    ///     fn serialise(data: &Self) -> Cow<'_, [u8]> { data.0.as_bytes().into() }
+    /// }
+    ///
+    /// # async fn example() -> anyhow::Result<()> {
+    /// let mut publisher = PublishWrapper::<Event, _>::with_dynamic_key(
+    ///     "events",
+    ///     false,
+    ///     None,
+    ///     None,
+    ///     None,
+    /// ).await;
+    ///
+    /// publisher.send((Event("{}".to_string()), "user.created")).await?;
+    /// publisher.send((Event("{}".to_string()), "order.placed")).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn with_dynamic_key(
         exchange: E,
         wait_for_confirm: bool,

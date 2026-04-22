@@ -23,10 +23,26 @@ pub enum CommitAction {
 
 // ── RAII guard returned to the caller ───────────────────────────────────────
 
-/// Drop-based ack/nack guard for batched commits.
-/// Behaves like `AutoAck`: defaults to ack on drop; call `change_to_nack` to
-/// override before the guard goes out of scope, or `execute` for an explicit
-/// async send.
+/// RAII ack/nack guard used with the batched-commit consumer variant.
+///
+/// Obtained from the stream returned by
+/// [`StreamBuilder::create_multi_auto_ack`](crate::stream_builder::StreamBuilder::create_multi_auto_ack).
+///
+/// Unlike [`AutoAck`](crate::auto_ack::AutoAck), this guard does **not** send
+/// an AMQP frame immediately.  Instead it records the decision with the
+/// associated [`Commits`] tracker.  On the next periodic tick, all contiguous
+/// decided deliveries at the front of the in-flight list are flushed in a
+/// single `basic_ack(multiple=true)` or `basic_nack(multiple=true)` call.
+///
+/// The default action is **ack**.  Call [`change_to_nack`](AutoAckMulti::change_to_nack)
+/// before the guard is dropped to nack instead.  Call
+/// [`execute`](AutoAckMulti::execute) for an explicit async send.
+///
+/// # Important
+///
+/// Batching is only as efficient as the order in which decisions arrive.
+/// A single `Pending` delivery blocks all subsequent flushes until it is
+/// decided, so ensure every `AutoAckMulti` is eventually resolved.
 pub struct AutoAckMulti {
     data: Option<Data>,
 }
@@ -38,7 +54,10 @@ struct Data {
 }
 
 impl AutoAckMulti {
-
+    /// Creates a no-op guard that carries no delivery tag.
+    ///
+    /// Useful as a placeholder where an `AutoAckMulti` is required by type but
+    /// no actual delivery is associated (e.g. in tests or sentinel values).
     pub fn empty() -> Self {
         Self { data: None }
     }
@@ -50,13 +69,21 @@ impl AutoAckMulti {
         }
     }
 
+    /// Switch the pending action from ack to **nack**.
+    ///
+    /// Has no effect on an [`empty`](AutoAckMulti::empty) guard or after
+    /// [`execute`](AutoAckMulti::execute) has been called.
     pub fn change_to_nack(&mut self) {
         if let Some(data) = self.data.as_mut() {
             data.action = Action::Nack;
         }
     }
 
-    /// Explicitly send the commit decision now (async).
+    /// Record the decision immediately rather than waiting for drop.
+    ///
+    /// The decision is sent to the [`Commits`] channel; the actual AMQP frame
+    /// is still issued on the next [`Commits::perform_auto_acking`] tick.
+    /// Subsequent drops are no-ops.
     pub async fn execute(&mut self) {
         if let Some(data) = self.data.take() {
             // tracing::error!(tag = data.tag, action = ?data.action, counter = data.counter, "Sending commit action");
@@ -97,15 +124,68 @@ struct Entry {
 
 // ── Commits ──────────────────────────────────────────────────────────────────
 
-/// Tracks in-flight deliveries and periodically flushes them in batches.
+/// Batched ack/nack tracker paired with the multi-auto-ack consumer stream.
 ///
-/// When `perform_auto_acking` is called it walks the front of the in-order
-/// entry list, stopping at the first `Pending` entry.  Within the decided
-/// prefix it groups consecutive same-action entries and issues a single
-/// `basic_ack(multiple=true)` or `basic_nack(multiple=true)` per group,
-/// using only the highest tag's `Acker` (which covers all lower tags on the
-/// same channel).  All intermediate ackers are dropped without sending any
-/// AMQP frame.
+/// `Commits` is created internally by
+/// [`StreamBuilder::create_multi_auto_ack`](crate::stream_builder::StreamBuilder::create_multi_auto_ack).
+/// You only need to interact with it directly if you are building a custom
+/// consumer loop.
+///
+/// ## How batching works
+///
+/// 1. Each incoming delivery is registered with [`add_message`](Commits::add_message),
+///    which returns an [`AutoAckMulti`] guard for the caller and stores an entry
+///    in the in-flight list.
+/// 2. When a guard is dropped (or [`execute`](AutoAckMulti::execute) is called),
+///    the decision (ack/nack) is sent back via an internal channel.
+/// 3. [`commit_tag`](Commits::commit_tag) drains that channel and marks entries
+///    as decided.
+/// 4. [`perform_auto_acking`](Commits::perform_auto_acking) walks the front of
+///    the in-flight list, stops at the first `Pending` entry, and issues one
+///    `basic_ack(multiple=true)` or `basic_nack(multiple=true)` per consecutive
+///    run of the same action.  All intermediate [`Acker`]s are dropped without
+///    sending any AMQP frame — only the final one in each run is used.
+///
+/// ## Example — custom loop
+///
+/// ```rust,no_run
+/// use rabbit_auto::multi_auto_ack::Commits;
+/// use rabbit_auto::stream_builder::{StreamBuilder, Deserialise};
+/// use futures::StreamExt;
+/// use anyhow::Result;
+///
+/// struct Msg(Vec<u8>);
+/// impl Deserialise for Msg {
+///     fn deserialise(data: Vec<u8>) -> Result<Self> { Ok(Msg(data)) }
+/// }
+///
+/// # async fn example() {
+/// let mut consumer = StreamBuilder {
+///     exchange: "events",
+///     routing_key: "my.key",
+///     tag: "batch-consumer",
+///     ..Default::default()
+/// }
+/// .create_plain()
+/// .await;
+///
+/// let (mut commits, mut action_rx) = Commits::new();
+///
+/// loop {
+///     tokio::select! {
+///         Some(delivery) = consumer.next() => {
+///             let (guard, data) = commits.add_message(delivery);
+///             // hand `guard` and `data` to your processing logic
+///             drop(guard); // defaults to ack
+///         }
+///         Some(action) = action_rx.recv() => {
+///             commits.commit_tag(action);
+///         }
+///     }
+///     // call commits.perform_auto_acking().await periodically
+/// }
+/// # }
+/// ```
 pub struct Commits {
     sender: tokio::sync::mpsc::Sender<CommitAction>,
     /// In-arrival order; new entries always appended at the back.

@@ -1,4 +1,4 @@
-//! Helper to auto ack deliveries
+//! RAII ack/nack guard ([`AutoAck`]) and the [`auto_ack`] stream adapter.
 
 use anyhow::Result;
 use futures::{Stream, StreamExt};
@@ -11,18 +11,63 @@ enum Action {
     Nack(Option<BasicNackOptions>),
     Reject(Option<BasicRejectOptions>),
 }
-/// Automatically ack delivery when this struct drops.
-/// There is an option to automatically nack the delivery.
+
+/// RAII guard that acks (or nacks/rejects) a delivery when dropped.
+///
+/// Obtained from the stream returned by
+/// [`StreamBuilder::create_auto_ack`](crate::stream_builder::StreamBuilder::create_auto_ack).
+///
+/// The default action is **ack**.  Call [`change_to_nack`](AutoAck::change_to_nack) or
+/// [`change_to_reject`](AutoAck::change_to_reject) before the guard is dropped to
+/// override it.  Call [`execute`](AutoAck::execute) for an explicit async send
+/// (the drop will then be a no-op).
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use rabbit_auto::stream_builder::{StreamBuilder, Deserialise};
+/// use futures::StreamExt;
+/// use anyhow::Result;
+///
+/// struct Order { id: u64 }
+/// impl Deserialise for Order {
+///     fn deserialise(data: Vec<u8>) -> Result<Self> {
+///         // parse your message here
+///         Ok(Order { id: 0 })
+///     }
+/// }
+///
+/// # async fn example() -> Result<()> {
+/// let mut stream = StreamBuilder {
+///     exchange: "orders",
+///     routing_key: "order.placed",
+///     tag: "order-processor",
+///     ..Default::default()
+/// }
+/// .create_auto_ack::<Order>()
+/// .await;
+///
+/// while let Some((mut ack, result)) = stream.next().await {
+///     match result {
+///         Ok(order) => {
+///             // process order …
+///             // ack is sent automatically on drop
+///         }
+///         Err(_) => {
+///             ack.change_to_nack(None); // will nack on drop
+///         }
+///     }
+/// }
+/// # Ok(())
+/// # }
+/// ```
 pub struct AutoAck {
     acker: Option<Acker>,
     action: Action,
 }
 
 impl AutoAck {
-    /// Creates a new auto ack
-    /// # Arguments:
-    /// * channel - the channel where this delivery was received on
-    /// * delivery - delivery which was received. This will take its id of the delivery.
+    /// Creates a guard that acks on drop.
     pub fn new(acker: Acker) -> Self {
         Self {
             acker: Some(acker),
@@ -30,7 +75,7 @@ impl AutoAck {
         }
     }
 
-    /// Creates a new auto ack with BasicAckOptions
+    /// Creates a guard that acks on drop with explicit [`BasicAckOptions`].
     pub fn new_ack(acker: Acker, options: BasicAckOptions) -> Self {
         Self {
             acker: Some(acker),
@@ -38,6 +83,7 @@ impl AutoAck {
         }
     }
 
+    /// Creates a guard that nacks on drop with explicit [`BasicNackOptions`].
     pub fn new_nack(acker: Acker, options: BasicNackOptions) -> Self {
         Self {
             acker: Some(acker),
@@ -45,6 +91,7 @@ impl AutoAck {
         }
     }
 
+    /// Creates a guard that rejects on drop with explicit [`BasicRejectOptions`].
     pub fn new_reject(acker: Acker, options: BasicRejectOptions) -> Self {
         Self {
             acker: Some(acker),
@@ -52,21 +99,32 @@ impl AutoAck {
         }
     }
 
-    /// Change the auto ack in to auto nack
+    /// Switch the pending action from ack to **nack**.
+    ///
+    /// Has no effect if [`execute`](AutoAck::execute) or [`release`](AutoAck::release)
+    /// has already been called.
     pub fn change_to_nack(&mut self, options: Option<BasicNackOptions>) {
         self.action = Action::Nack(options);
     }
 
+    /// Switch the pending action to **reject**.
     pub fn change_to_reject(&mut self, options: Option<BasicRejectOptions>) {
         self.action = Action::Reject(options);
     }
 
-    /// Release the channel and the tag from this
+    /// Take the [`Acker`] out of this guard without sending any AMQP frame.
+    ///
+    /// After calling `release` the drop is a no-op.  Use this when you want to
+    /// manage acknowledgement yourself (e.g. pass the `Acker` somewhere else).
     pub fn release(&mut self) -> Option<Acker> {
         self.acker.take()
     }
 
-    /// Perform the ack or nack on the channel, if this has not been already done or released.
+    /// Send the ack/nack/reject now, asynchronously.
+    ///
+    /// Subsequent drops are no-ops.  Prefer this over relying on drop when you
+    /// need the error returned or need to ensure the frame is sent before
+    /// proceeding.
     pub async fn execute(&mut self) -> Result<()> {
         if let Some(acker) = self.acker.take() {
             match self.action {
@@ -120,8 +178,16 @@ impl Drop for AutoAck {
     }
 }
 
-/// Map consumer stream into automatically ack stream. The AutoAck object can still be used to release the ack,
-/// and manually ack it or not ack it.
+/// Wraps a raw [`Delivery`] stream into an `(AutoAck, payload)` stream.
+///
+/// Each delivery is paired with an [`AutoAck`] guard.  The guard acks on drop
+/// by default; call [`AutoAck::change_to_nack`] or [`AutoAck::execute`] to
+/// override.
+///
+/// This is called internally by
+/// [`StreamBuilder::create_auto_ack`](crate::stream_builder::StreamBuilder::create_auto_ack).
+/// You only need to call it directly when working with a raw
+/// [`create_plain`](crate::stream_builder::StreamBuilder::create_plain) stream.
 pub fn auto_ack<S: StreamExt + Stream<Item = Delivery>>(
     stream: S,
 ) -> impl Stream<Item = (AutoAck, Vec<u8>)> {
