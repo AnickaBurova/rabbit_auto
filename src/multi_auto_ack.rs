@@ -7,7 +7,7 @@ use lapin::{
 
 // ── Action carried by AutoAckMulti ──────────────────────────────────────────
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 enum Action {
     Ack,
     Nack,
@@ -15,6 +15,7 @@ enum Action {
 
 // ── Channel message ──────────────────────────────────────────────────────────
 
+#[derive(Debug)]
 pub enum CommitAction {
     Ack(DeliveryTag),
     Nack(DeliveryTag),
@@ -27,57 +28,67 @@ pub enum CommitAction {
 /// override before the guard goes out of scope, or `execute` for an explicit
 /// async send.
 pub struct AutoAckMulti {
+    data: Option<Data>,
+}
+
+struct Data {
     tag: DeliveryTag,
     action: Action,
     sender: tokio::sync::mpsc::Sender<CommitAction>,
-    sent: bool,
 }
 
 impl AutoAckMulti {
-    fn build_action(&self) -> CommitAction {
-        match self.action {
-            Action::Ack => CommitAction::Ack(self.tag),
-            Action::Nack => CommitAction::Nack(self.tag),
+
+    pub fn empty() -> Self {
+        Self { data: None }
+    }
+
+    fn build_action(action: Action, tag: DeliveryTag) -> CommitAction {
+        match action {
+            Action::Ack => CommitAction::Ack(tag),
+            Action::Nack => CommitAction::Nack(tag),
         }
     }
 
     pub fn change_to_nack(&mut self) {
-        self.action = Action::Nack;
+        if let Some(data) = self.data.as_mut() {
+            data.action = Action::Nack;
+        }
     }
 
     /// Explicitly send the commit decision now (async).
     pub async fn execute(&mut self) {
-        if !self.sent {
-            self.sent = true;
-            let action = self.build_action();
-            let _ = self.sender.send(action).await;
+        if let Some(data) = self.data.take() {
+            // tracing::error!(tag = data.tag, action = ?data.action, counter = data.counter, "Sending commit action");
+            let action = Self::build_action(data.action, data.tag);
+            let _ = data.sender.send(action).await;
         }
     }
 }
 
 impl Drop for AutoAckMulti {
     fn drop(&mut self) {
-        if !self.sent {
-            self.sent = true;
-            let action = self.build_action();
-            // try_send is the only non-async option in Drop.
-            // The channel is large (8192 slots) so this should never fail in
-            // practice; if it does the delivery will simply be requeued on
-            // channel closure.
-            let _ = self.sender.try_send(action);
+        if let Some(data) = self.data.take() {
+            // tracing::error!(tag = data.tag, action = ?data.action, counter = data.counter, "Sending commit action in drop");
+            let action = Self::build_action(data.action, data.tag);
+            let sender = data.sender;
+            tokio::spawn(async move {
+                let _ = sender.send(action).await;
+            });
         }
     }
 }
 
 // ── Per-entry bookkeeping ────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum TagState {
     Pending,
     Acked,
     Nacked,
 }
 
+#[derive(Debug)]
 struct Entry {
     tag: DeliveryTag,
     acker: Acker,
@@ -127,23 +138,28 @@ impl Commits {
             state: TagState::Pending,
         });
         let guard = AutoAckMulti {
-            tag,
-            action: Action::Ack,
-            sender: self.sender.clone(),
-            sent: false,
+            data: Some(Data {
+                tag,
+                action: Action::Ack,
+                sender: self.sender.clone(),
+            }),
         };
         (guard, data)
     }
 
     /// Records an ack or nack decision sent by an `AutoAckMulti` guard.
     pub fn commit_tag(&mut self, action: CommitAction) {
+        // tracing::warn!(action = ?action, "Committing action");
         let (tag, new_state) = match action {
             CommitAction::Ack(t) => (t, TagState::Acked),
             CommitAction::Nack(t) => (t, TagState::Nacked),
         };
         match self.entries.iter_mut().find(|e| e.tag == tag) {
-            Some(entry) => entry.state = new_state,
-            None => log::warn!("commit_tag: delivery tag {tag} not found in in-flight list"),
+            Some(entry) => {
+                // tracing::info!(counter = entry.counter, "Committing action for counter");
+                entry.state = new_state;
+            }
+            None => tracing::warn!("commit_tag: delivery tag {tag} not found in in-flight list"),
         }
     }
 
@@ -162,6 +178,7 @@ impl Commits {
         if committed_len == 0 {
             return Ok(());
         }
+        // tracing::error!(committed_len = committed_len, "Performing auto-acking");
 
         let to_process: Vec<Entry> = self.entries.drain(..committed_len).collect();
         let mut iter = to_process.into_iter().peekable();
@@ -182,13 +199,13 @@ impl Commits {
             let last = last.unwrap(); // safe: the peek guard ensures at least one iteration
 
             if is_ack {
-                log::warn!("multi-ack up to delivery tag {}", last.tag);
+                // tracing::warn!("multi-ack up to delivery tag {}", last.tag);
                 last.acker
                     .ack(BasicAckOptions { multiple: true })
                     .await
                     .map_err(|e| anyhow::anyhow!("multi-ack failed: {e}"))?;
             } else {
-                log::warn!("multi-nack up to delivery tag {}", last.tag);
+                // tracing::warn!("multi-nack up to delivery tag {}", last.tag);
                 last.acker
                     .nack(BasicNackOptions {
                         multiple: true,
@@ -198,6 +215,8 @@ impl Commits {
                     .map_err(|e| anyhow::anyhow!("multi-nack failed: {e}"))?;
             }
         }
+
+        // tracing::error!(committed_len = committed_len, entries = self.entries.len(), "Auto-acking completed");
 
         Ok(())
     }

@@ -69,7 +69,7 @@ where
                 )
                 .await
             {
-                log::warn!("Deleting incompatible queue: {}", err);
+                tracing::warn!("Deleting incompatible queue: {}", err);
                 if self.incompatible_delete {
                     let msgs = channel
                         .queue_delete(
@@ -81,16 +81,16 @@ where
                             },
                         )
                         .await?;
-                    log::warn!("Incompatible queue deleted");
+                    tracing::warn!("Incompatible queue deleted");
                     if msgs > 0 {
-                        log::warn!("Deleting the previous queue purged {} messages", msgs);
+                        tracing::warn!("Deleting the previous queue purged {} messages", msgs);
                     }
                     Err(err)?;
                 } else {
                     Err(err)?;
                 }
             }
-            log::trace!("Queue declared, binding it");
+            tracing::trace!("Queue declared, binding it");
 
             channel
                 .queue_bind(
@@ -163,6 +163,8 @@ where
         let mut consumer = self.create_plain().await;
         let (sx, rx) = tokio::sync::mpsc::channel(bounded_buffer_size);
         tokio::spawn(async move {
+            use std::collections::VecDeque;
+
             let (sc_tick, mut rx_tick) = tokio::sync::mpsc::channel(4);
             tokio::spawn(async move {
                 let period = period.to_std().unwrap();
@@ -172,24 +174,55 @@ where
                 }
             });
             let (mut commits, mut action_receiver) = crate::multi_auto_ack::Commits::new();
+            let mut backlog = VecDeque::with_capacity(bounded_buffer_size);
             loop {
-                tokio::select! {
-                    Some(delivery) = consumer.next() => {
-                        let (ack, data) = commits.add_message(delivery);
-                        sx.send((ack, I::deserialise(data))).await.unwrap();
-                    }
-                    Some(action) = action_receiver.recv() => {
-                        commits.commit_tag(action);
-                    }
-                    _ = rx_tick.recv() => {
-                        log::warn!("Performing auto-acking");
-                        // Drain all decisions that arrived since the last tick
-                        // before flushing, so the batch is as complete as possible.
-                        while let Ok(action) = action_receiver.try_recv() {
+                let mut commiting = false;
+                if backlog.is_empty() {
+                    tokio::select! {
+                        Some(delivery) = consumer.next() => {
+                            let (ack, data) = commits.add_message(delivery);
+                            backlog.push_back((ack, I::deserialise(data)));
+                        }
+                        Some(action) = action_receiver.recv() => {
                             commits.commit_tag(action);
                         }
-                        commits.perform_auto_acking().await.unwrap();
+                        _ = rx_tick.recv() => {
+                            commiting = true;
+                        }
                     }
+
+                } else {
+                    tokio::select! {
+                        Some(action) = action_receiver.recv() => {
+                            commits.commit_tag(action);
+                        }
+                        _ = rx_tick.recv() => {
+                            commiting = true;
+                        }
+                    }
+                }
+
+                while let Some(msg) = backlog.pop_front() {
+                    if let Err(err) = sx.try_send(msg) {
+                        match err {
+                            tokio::sync::mpsc::error::TrySendError::Full(msg) => {
+                                backlog.push_front(msg);
+                                break;
+                            }
+                            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                                return;
+                            }
+                        }
+                    }
+                }
+                if commiting {
+                    tracing::warn!("Performing auto-acking");
+                    // Drain all decisions that arrived since the last tick
+                    // before flushing, so the batch is as complete as possible.
+                    while let Ok(action) = action_receiver.try_recv() {
+                        commits.commit_tag(action);
+                    }
+                    commits.perform_auto_acking().await.unwrap();
                 }
             }
         });
@@ -271,6 +304,8 @@ where
         let mut consumer = self.create_plain().await;
         let (sx, rx) = tokio::sync::mpsc::channel(bounded_buffer_size);
         tokio::spawn(async move {
+            use std::collections::VecDeque;
+
             let (sc_tick, mut rx_tick) = tokio::sync::mpsc::channel(4);
             tokio::spawn(async move {
                 let period = period.to_std().unwrap();
@@ -280,23 +315,55 @@ where
                 }
             });
             let (mut commits, mut action_receiver) = crate::multi_auto_ack::Commits::new();
+            let mut backlog = VecDeque::with_capacity(bounded_buffer_size);
             loop {
-                tokio::select! {
-                    Some(delivery) = consumer.next() => {
-                        let (ack, data) = commits.add_message(delivery);
-                        sx.send((ack, I::deserialise(data))).await.unwrap();
-                    }
-                    Some(action) = action_receiver.recv() => {
-                        commits.commit_tag(action);
-                    }
-                    _ = rx_tick.recv() => {
-                        // Drain all decisions that arrived since the last tick
-                        // before flushing, so the batch is as complete as possible.
-                        while let Ok(action) = action_receiver.try_recv() {
+                let mut commiting = false;
+                if backlog.is_empty() {
+                    tokio::select! {
+                        Some(delivery) = consumer.next() => {
+                            let (ack, data) = commits.add_message(delivery);
+                            backlog.push_back((ack, I::deserialise(data)));
+                        }
+                        Some(action) = action_receiver.recv() => {
                             commits.commit_tag(action);
                         }
-                        commits.perform_auto_acking().await.unwrap();
+                        _ = rx_tick.recv() => {
+                            commiting = true;
+                        }
                     }
+
+                } else {
+                    tokio::select! {
+                        Some(action) = action_receiver.recv() => {
+                            commits.commit_tag(action);
+                        }
+                        _ = rx_tick.recv() => {
+                            commiting = true;
+                        }
+                    }
+                }
+
+                while let Some(msg) = backlog.pop_front() {
+                    if let Err(err) = sx.try_send(msg) {
+                        match err {
+                            tokio::sync::mpsc::error::TrySendError::Full(msg) => {
+                                backlog.push_front(msg);
+                                break;
+                            }
+                            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                                return;
+                            }
+                        }
+                    }
+                }
+                if commiting {
+                    tracing::warn!("Performing auto-acking");
+                    // Drain all decisions that arrived since the last tick
+                    // before flushing, so the batch is as complete as possible.
+                    while let Ok(action) = action_receiver.try_recv() {
+                        commits.commit_tag(action);
+                    }
+                    commits.perform_auto_acking().await.unwrap();
                 }
             }
         });
