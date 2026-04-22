@@ -6,12 +6,12 @@
 // macro_rules! log_error {
 //     ($action: expr) => {
 //         if let Err(err) = $action {
-//             log::error!("{}: {}", stringify!($action), err);
+//             tracing::error!("{}: {}", stringify!($action), err);
 //         }
 //     };
 //     ($action: expr, $msg: expr) => {
 //         if let Err(err) = $action {
-//             log::error!("{}: {}", $msg, err);
+//             tracing::error!("{}: {}", $msg, err);
 //         }
 //     };
 // }

@@ -27,22 +27,22 @@ impl Channels {
         let index = self.current;
         self.current = (self.current + 1) % super::MAX_CHANNELS;
         if self.channels.len() < index + 1 {
-            log::debug!("Creating a new channel: {index}");
+            tracing::debug!("Creating a new channel: {index}");
             let channel = Arc::new(connection.create_channel().await?);
             self.channels.push(channel.clone());
             Ok(channel)
         } else {
-            log::debug!("Returning ring channel {index}");
+            tracing::debug!("Returning ring channel {index}");
             Ok(self.channels[index].clone())
         }
     }
 
     pub(crate) async fn try_close(&mut self) {
-        log::trace!("Closing all channels: {}", self.channels.len());
+        tracing::trace!("Closing all channels: {}", self.channels.len());
         for channel in self.channels.drain(..) {
-            log::trace!("Closing channel[{}]: {:?}", channel.id(), channel.status().state());
+            tracing::trace!("Closing channel[{}]: {:?}", channel.id(), channel.status().state());
             if let Err(err) = channel.close(0, "Restarting the connection").await {
-                log::error!("Failed to close an existing channel: {err}");
+                tracing::error!("Failed to close an existing channel: {err}");
             }
         }
         self.current = 0;

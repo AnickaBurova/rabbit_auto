@@ -17,18 +17,18 @@ pub fn create_exchange(exchange: String, kind: ExchangeKind, options: Option<Exc
             let backup_arguments = arguments.clone();
             let backup_options = options.clone();
             if let Err(err) = channel.exchange_declare(&exchange, kind.clone(), options.unwrap_or_else(|| ExchangeDeclareOptions::default()), arguments.unwrap_or_else(|| FieldTable::default())).await {
-                log::error!("Failed to declare exchange: {}", err);
-                log::warn!("Deleting the old one and creating a new one");
+                tracing::error!("Failed to declare exchange: {}", err);
+                tracing::warn!("Deleting the old one and creating a new one");
 
                 match channel.exchange_delete(&exchange, ExchangeDeleteOptions { if_unused: false, nowait: true}).await {
                     Ok(()) => {
                         if let Err(err) = channel.exchange_declare(&exchange, kind.clone(), backup_options.unwrap_or_else(|| ExchangeDeclareOptions::default()), backup_arguments.unwrap_or_else(|| FieldTable::default())).await {
-                            log::error!("Failed to declare exchange (Exiting): {}", err);
+                            tracing::error!("Failed to declare exchange (Exiting): {}", err);
                             std::process::exit(1);
                         }
                     }
                     Err(err) => {
-                        log::error!("Cannot delete the exchange to declare a new one (Exiting): {}", err);
+                        tracing::error!("Cannot delete the exchange to declare a new one (Exiting): {}", err);
                         std::process::exit(1);
                     }
                 }

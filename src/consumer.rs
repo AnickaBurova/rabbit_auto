@@ -63,14 +63,14 @@ impl ConsumerWrapper {
     /// as often as we loose connection to the rabbitmq.
     // pub async fn new(creator: ConsumerCreator) -> Result<Self> {
     //     let (creator, (channel, consumer)) = Self::connect(creator).await?;
-    //     log::debug!("Consumer wrapper created");
+    //     tracing::debug!("Consumer wrapper created");
     //     Ok(Self { state: Some(State::Idle { consumer, channel, creator }) })
     // }
     pub(crate) async fn new(creator: ConsumerCreator) -> Self {
-        log::trace!("Getting channel requester");
+        tracing::trace!("Getting channel requester");
         let channel_requester = Comms::get_channel_comms();
         let (channel_sender, mut channel_receiver) = Comms::create_channel_channel();
-        log::trace!("Creating the consumer using the creator");
+        tracing::trace!("Creating the consumer using the creator");
         let (consumer, channel) = creator
             .start_dispatch(
                 None,
@@ -79,7 +79,7 @@ impl ConsumerWrapper {
                 &channel_requester,
             )
             .await;
-        log::trace!("Consumer wrapper created");
+        tracing::trace!("Consumer wrapper created");
         Self {
             state: Some(State::Idle(Data {
                 consumer,
@@ -96,20 +96,20 @@ impl ConsumerWrapper {
     async fn next_item(mut data: Data) -> (Delivery, Data) {
         loop {
             use futures::stream::StreamExt;
-            log::trace!("Polling consumer");
+            tracing::trace!("Polling consumer");
             match data.consumer.next().await {
                 Some(Ok(delivery)) => {
-                    log::trace!("Got delivery");
+                    tracing::trace!("Got delivery");
                     return (delivery, data);
                 }
                 Some(Err(err)) => {
-                    log::error!("Failed to consume a message: {}", err);
+                    tracing::error!("Failed to consume a message: {}", err);
                 }
                 None => {
-                    log::error!("Consumer has finished for some reason!");
+                    tracing::error!("Consumer has finished for some reason!");
                 }
             }
-            log::warn!("Consumer is broken, waiting for a new connection");
+            tracing::warn!("Consumer is broken, waiting for a new connection");
             let (consumer, channel) = data
                 .creator
                 .start_dispatch(
@@ -128,7 +128,7 @@ impl ConsumerWrapper {
 impl Stream for ConsumerWrapper {
     type Item = Delivery;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        log::trace!("Poll next");
+        tracing::trace!("Poll next");
         let this = Pin::into_inner(self);
 
         loop {
@@ -143,12 +143,12 @@ impl Stream for ConsumerWrapper {
                     return match Future::poll(action, cx) {
                         Poll::Pending => {
                             this.state = Some(State::Next { next });
-                            log::trace!("Pending");
+                            tracing::trace!("Pending");
                             Poll::Pending
                         }
                         Poll::Ready((delivery, data)) => {
                             this.state = Some(State::Idle(data));
-                            log::trace!("Ready");
+                            tracing::trace!("Ready");
                             Poll::Ready(Some(delivery))
                         }
                     };

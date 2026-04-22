@@ -35,12 +35,12 @@ impl Data {
             self.current_channel_index = 0;
         }
         if self.channels.len() < index + 1 {
-            log::trace!("Creating a new channel: {}", self.channels.len());
+            tracing::trace!("Creating a new channel: {}", self.channels.len());
             let channel = Arc::new(self.connection.create_channel().await?);
             self.channels.push(channel.clone());
             Ok(channel)
         } else {
-            log::trace!("Returning ring channel {}", index);
+            tracing::trace!("Returning ring channel {}", index);
             Ok(self.channels[index].clone())
         }
     }
@@ -49,11 +49,11 @@ impl Data {
         for channel in self.channels.drain(..) {
 
             if let Err(err) = channel.close(0, "restarting connection").await {
-                log::error!("Failed to close a channel: {}", err);
+                tracing::error!("Failed to close a channel: {}", err);
             }
         }
         self.current_channel_index = 0;
-        log::warn!("Closing rabbit connection");
+        tracing::warn!("Closing rabbit connection");
         self.connection.close(0, "Restarting connection").await?;
         Ok(())
     }

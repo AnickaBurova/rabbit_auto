@@ -43,12 +43,12 @@ impl Comms {
     /// Declare exchange
     pub async fn declare_exchange(exchange: String, declare: DeclareExchange) {
         let sender = Self::channel_comms().0;
-        log::debug!("Sending {exchange} declaration to the rabbit loop");
+        tracing::debug!("Sending {exchange} declaration to the rabbit loop");
         if let Err(err) = sender
             .send(CommsMsg::DeclareExchange { exchange, declare })
             .await
         {
-            log::error!("Declare exchange internal comms is broken: {err}");
+            tracing::error!("Declare exchange internal comms is broken: {err}");
             std::process::exit(-1);
         }
     }
@@ -88,17 +88,17 @@ impl Comms {
         spawner.spawn(Box::pin(async move {
             // let (mut channel_requester, mut declare_exchange_requester)  = {
             let mut msg_receiver = {
-                log::debug!("Taking the channel requester from the global area");
+                tracing::debug!("Taking the channel requester from the global area");
                 let singleton = Self::channel_comms().1.clone();
                 let mut channel_receiver = singleton.lock().await;
                 if let Some(cr) = channel_receiver.take() {
                     cr
                 } else {
-                    log::error!("Fatal error. No channel receiver found. Is the Comms::configure called the second time?");
+                    tracing::error!("Fatal error. No channel receiver found. Is the Comms::configure called the second time?");
                     std::process::exit(1);
                 }
             };
-            log::debug!("Channel requester taken, we can start the rabbit loop");
+            tracing::debug!("Channel requester taken, we can start the rabbit loop");
             let mut connection: Option<Connection> = None;
             let mut connection_attempt = 0;
             let mut declare_exchanges = HashMap::new();
@@ -112,17 +112,17 @@ impl Comms {
                 for msg in msgs.into_iter() {
                     match msg {
                         CommsMsg::DeclareExchange { exchange, declare } => {
-                            log::trace!("Received a new exchange declaration for {exchange}");
+                            tracing::trace!("Received a new exchange declaration for {exchange}");
                             declare_exchanges.insert(exchange, declare);
                         }
                         CommsMsg::RequestChannel(cs) => {
-                            log::trace!("There is a request for a channel");
+                            tracing::trace!("There is a request for a channel");
                             channel_sender.push(cs);
                         }
                     }
                 }
                 if channel_sender.is_empty() {
-                    log::debug!("No channel requesters yet, going back waiting");
+                    tracing::debug!("No channel requesters yet, going back waiting");
                     continue;
                 }
                 // try to establish a connection until we have one and can send a channel back to the requester
@@ -130,36 +130,36 @@ impl Comms {
                     // connect
                     if let Some(conn) = connection.take() {
                         // validate the connection
-                        log::debug!("Validating an existing connection");
+                        tracing::debug!("Validating an existing connection");
                         'connection: loop {
                             match conn.status().state() {
                                 ConnectionState::Initial | ConnectionState::Connecting | ConnectionState::Reconnecting => {
-                                    log::debug!("Connecting is in progress");
+                                    tracing::debug!("Connecting is in progress");
                                     // lets check again in a while
                                     rt.sleep(std::time::Duration::from_millis(100)).await;
                                 }
                                 ConnectionState::Connected => {
                                     // the connection is valid
                                     if is_connecting {
-                                        log::info!("Connection to RabbitMQ established");
+                                        tracing::info!("Connection to RabbitMQ established");
                                         is_connecting = false;
                                     } else {
-                                        log::debug!("RabbitMQ is already connected");
+                                        tracing::debug!("RabbitMQ is already connected");
                                     }
                                     if !declare_exchanges.is_empty() {
-                                        log::debug!("There are {} exchanges to declare", declare_exchanges.len());
+                                        tracing::debug!("There are {} exchanges to declare", declare_exchanges.len());
                                         match channels.create_channel(&conn).await {
                                             Ok(channel) => {
                                                 // run all exchange declarations
                                                 while !declare_exchanges.is_empty() {
                                                     let mut done = None;
                                                     for (exchange, declare) in declare_exchanges.iter() {
-                                                        log::debug!("Running exchange declaration for '{exchange}'");
+                                                        tracing::debug!("Running exchange declaration for '{exchange}'");
                                                         if let Err(err) = declare(channel.clone()).await {
-                                                            log::error!("Failed to declare an exchange: {err}");
+                                                            tracing::error!("Failed to declare an exchange: {err}");
                                                             continue 'connection;
                                                         }
-                                                        log::debug!("Exchange '{exchange}' declared");
+                                                        tracing::debug!("Exchange '{exchange}' declared");
                                                         done = Some(exchange.clone());
                                                         break;
                                                     }
@@ -170,38 +170,38 @@ impl Comms {
                                             }
                                             Err(err) => {
                                                 // creating the channel failed, we need a new connection
-                                                log::error!("Connection to rabbit failed, reconnecting: {err}");
+                                                tracing::error!("Connection to rabbit failed, reconnecting: {err}");
                                             }
                                         }
                                     }
                                     connection = Some(conn);
-                                    log::debug!("Connection initialised");
+                                    tracing::debug!("Connection initialised");
                                     break;
                                 }
                                 ConnectionState::Closing |
                                 ConnectionState::Closed |
                                 ConnectionState::Error => {
-                                    log::warn!("Failed to connect to the rabbit server, will try to reconnect");
-                                    log::trace!("Sleeping for {} seconds", config.reconnect_delay.as_secs_f64());
+                                    tracing::warn!("Failed to connect to the rabbit server, will try to reconnect");
+                                    tracing::trace!("Sleeping for {} seconds", config.reconnect_delay.as_secs_f64());
                                     rt.sleep(config.reconnect_delay).await;
                                     break;
                                 }
                             }
                         }
                     } else {
-                        log::debug!("There is no connection yet");
+                        tracing::debug!("There is no connection yet");
                     }
                     // check if the connection exists or we need a new one
                     if let Some(conn) = connection.take() {
                         // so the connection should be valid, we can finally get the channel and send it
-                        log::debug!("Connection exist, getting channels");
+                        tracing::debug!("Connection exist, getting channels");
                         match channels.create_channels(channel_sender.len(), &conn).await {
                             Ok(channels) => {
-                                log::debug!("Channels are created, sending them to the individual requesters");
+                                tracing::debug!("Channels are created, sending them to the individual requesters");
                                 for (cs, channel) in channel_sender.drain(..).zip(channels) {
                                     let channel = Arc::downgrade(&channel);
                                     if let Err(err) = cs.send(channel).await {
-                                        log::error!("Fatal error. Failed to send the channel back to the requester: {err}");
+                                        tracing::error!("Fatal error. Failed to send the channel back to the requester: {err}");
                                         std::process::exit(1);
                                     }
                                 }
@@ -210,15 +210,15 @@ impl Comms {
                             }
                             Err(err) => {
                                 // creating the channel failed, we need a new connection
-                                log::error!("Connection to rabbit failed, reconnecting: {err}");
+                                tracing::error!("Connection to rabbit failed, reconnecting: {err}");
                             }
                         }
                     } else {
                         // we need a new one
-                        log::debug!("Closing any existing channels if any");
+                        tracing::debug!("Closing any existing channels if any");
                         channels.try_close().await; // close any existing channels
 
-                        log::debug!("No connection, attempting to connect [{connection_attempt}]",);
+                        tracing::debug!("No connection, attempting to connect [{connection_attempt}]",);
                         let mut properties = ConnectionProperties::default()
                             .with_connection_name(config.name.clone().into());
                         properties
@@ -230,12 +230,12 @@ impl Comms {
                         match con {
                             Ok(con) => {
                                 // we have a new connection, we will wait until fully connected
-                                log::info!("Connecting to RabbitMQ");
+                                tracing::info!("Connecting to RabbitMQ");
                                 connection = Some(con);
                             }
                             Err(err) => {
-                                log::error!("Failed to connect: {err}");
-                                log::debug!("Sleeping for {} seconds", config.reconnect_delay.as_secs_f64());
+                                tracing::error!("Failed to connect: {err}");
+                                tracing::debug!("Sleeping for {} seconds", config.reconnect_delay.as_secs_f64());
                                 rt.sleep(config.reconnect_delay).await;
                             }
                         }
@@ -275,45 +275,45 @@ pub(crate) trait RabbitDispatcher: Sync + Send {
                     .send(CommsMsg::RequestChannel(channel_sender.clone()))
                     .await
                 {
-                    log::error!("Fatal internal error. Failed to request a new channel: {err}");
+                    tracing::error!("Fatal internal error. Failed to request a new channel: {err}");
                     std::process::exit(1);
                 }
                 // now eventually the Channel should arrive over the channel_receiver
                 if let Some(channel) = channel_receiver.recv().await {
-                    log::trace!("Channel received");
+                    tracing::trace!("Channel received");
                     setup_channel = true;
                     channel
                 } else {
-                    log::error!("Fatal internal error. Failed to receive a new channel");
+                    tracing::error!("Fatal internal error. Failed to receive a new channel");
                     std::process::exit(1);
                 }
             };
             // ensure the channel is alive, if not, get a new one
             let channel = match channel.upgrade() {
                 None => {
-                    log::trace!("No channel, we are going to wait for a new one");
+                    tracing::trace!("No channel, we are going to wait for a new one");
                     continue;
                 }
                 Some(channel) => channel,
             };
 
             if setup_channel {
-                log::trace!("Setting up the channel");
+                tracing::trace!("Setting up the channel");
                 if let Err(err) = self.channel_setup(&channel).await {
-                    log::error!("Failed to setup the channel: {err}");
+                    tracing::error!("Failed to setup the channel: {err}");
                     continue;
                 }
-                log::trace!("Channel setup done");
+                tracing::trace!("Channel setup done");
             }
 
-            log::trace!("Dispatching the operation");
+            tracing::trace!("Dispatching the operation");
             match self.dispatcher(channel.as_ref()).await {
                 Ok(object) => {
-                    log::trace!("Operation is dispatched");
+                    tracing::trace!("Operation is dispatched");
                     return (object, Arc::downgrade(&channel));
                 }
                 Err(err) => {
-                    log::error!("Failed to failed to dispatch the operation: {}", err);
+                    tracing::error!("Failed to failed to dispatch the operation: {}", err);
                     continue;
                 }
             }
