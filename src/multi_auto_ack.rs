@@ -84,12 +84,13 @@ impl AutoAckMulti {
     /// The decision is sent to the [`Commits`] channel; the actual AMQP frame
     /// is still issued on the next [`Commits::perform_auto_acking`] tick.
     /// Subsequent drops are no-ops.
-    pub async fn execute(&mut self) {
+    pub async fn execute(&mut self) -> anyhow::Result<()> {
         if let Some(data) = self.data.take() {
             // tracing::error!(tag = data.tag, action = ?data.action, counter = data.counter, "Sending commit action");
             let action = Self::build_action(data.action, data.tag);
-            let _ = data.sender.send(action).await;
+            data.sender.send(action).await?;
         }
+        Ok(())
     }
 }
 

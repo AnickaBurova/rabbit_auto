@@ -343,7 +343,6 @@ where
                     }
                 }
                 if commiting {
-                    tracing::warn!("Performing auto-acking");
                     // Drain all decisions that arrived since the last tick
                     // before flushing, so the batch is as complete as possible.
                     while let Ok(action) = action_receiver.try_recv() {
@@ -554,7 +553,6 @@ where
                     }
                 }
                 if commiting {
-                    tracing::warn!("Performing auto-acking");
                     // Drain all decisions that arrived since the last tick
                     // before flushing, so the batch is as complete as possible.
                     while let Ok(action) = action_receiver.try_recv() {
